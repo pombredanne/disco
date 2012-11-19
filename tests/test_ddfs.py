@@ -5,10 +5,18 @@ from cStringIO import StringIO
 class DDFSUpdateTestCase(TestCase):
     data = StringIO('blobdata')
 
+    def setUp(self):
+        self.ddfs.delete('disco:test:blobs')
+
     def blobnames(self, tag):
         from disco.ddfs import DDFS
         return list(reversed(list(DDFS.blob_name(repl[0])
                                   for repl in self.ddfs.blobs(tag))))
+
+    def test_update_empty_new(self):
+        self.ddfs.push('disco:test:blobs', [], update=True)
+        self.assertEquals(len(self.blobnames('disco:test:blobs')), 0)
+        self.ddfs.delete('disco:test:blobs')
 
     def test_update(self):
         for i in range(5):
@@ -22,6 +30,16 @@ class DDFSUpdateTestCase(TestCase):
                            update=True,
                            delayed=True)
         self.assertEquals(len(self.blobnames('disco:test:blobs')), 2)
+        self.ddfs.delete('disco:test:blobs')
+
+    def test_no_garbage(self):
+        self.ddfs.push('disco:test:blobs',
+                       [(self.data, 'dup')] * 2,
+                       update=True)
+        tag_pre = self.ddfs.get('disco:test:blobs')
+        self.assertEquals(len(tag_pre['urls']), 1)
+        self.ddfs.tag('disco:test:blobs', tag_pre['urls'], update=True)
+        self.assertEquals(tag_pre['id'], self.ddfs.get('disco:test:blobs')['id'])
         self.ddfs.delete('disco:test:blobs')
 
     def test_random(self):
@@ -58,6 +76,10 @@ class DDFSUpdateTestCase(TestCase):
         self.ddfs.delete('disco:test:blobs')
 
 class DDFSWriteTestCase(TestCase):
+    def setUp(self):
+        self.ddfs.delete('disco:test:tag')
+        self.ddfs.delete('disco:test:blobs')
+
     def test_chunk(self):
         from disco.core import classic_iterator
         url = 'http://discoproject.org/media/text/chekhov.txt'
@@ -97,6 +119,21 @@ class DDFSWriteTestCase(TestCase):
         self.ddfs.put('disco:test:tag', [['tags']])
         self.assertEquals(self.ddfs.get('disco:test:tag')['urls'], [['tags']])
         self.ddfs.delete('tag://disco:test:tag')
+
+    def test_put_new(self):
+        self.ddfs.put('disco:test:tag', [])
+        self.assert_(self.ddfs.exists('disco:test:tag'))
+        self.ddfs.delete('disco:test:tag')
+
+    def test_put_no_garbage(self):
+        self.ddfs.tag('disco:test:tag', [['urls']])
+        tag_pre = self.ddfs.get('disco:test:tag')
+        self.assertEquals(tag_pre['urls'], [['urls']])
+        self.ddfs.tag('disco:test:tag', [])
+        tag_post = self.ddfs.get('disco:test:tag')
+        self.assertEquals(tag_pre['id'], tag_post['id'])
+        self.assertEquals(tag_post['urls'], [['urls']])
+        self.ddfs.delete('disco:test:tag')
 
     def test_delete(self):
         self.ddfs.delete('disco:test:notag')
@@ -292,3 +329,28 @@ class DDFSAuthTestCase(TestCase):
         self.ddfs.delete('disco:test:atomic1', token='secret1')
         self.ddfs.delete('disco:test:atomic2', token='secret2')
         self.ddfs.delete('disco:test:notoken')
+
+class DDFSDeleteTestCase(TestCase):
+    def setUp(self):
+        self.ddfs.push('disco:test:delete1', [(StringIO('datablob'), 'blobdata')])
+        self.ddfs.push('disco:test:delete2', [(StringIO('datablob'), 'blobdata')])
+
+    def test_create_delete_create(self):
+        self.ddfs.delete('disco:test:delete1')
+        self.assert_(not self.ddfs.exists('disco:test:delete1'))
+        self.ddfs.push('disco:test:delete1', [(StringIO('datablob'), 'blobdata')])
+        self.assert_(self.ddfs.exists('disco:test:delete1'))
+        self.assert_("disco:test:delete1" in self.ddfs.list('disco:test:delete1'))
+
+    def test_create_delete_create_token(self):
+        self.ddfs.delete('disco:test:delete2')
+        self.assert_(not self.ddfs.exists('disco:test:delete2'))
+        self.ddfs.push('disco:test:delete2',
+                       [(StringIO('abc'), 'atom')],
+                       token='secret1')
+        self.assert_(self.ddfs.exists('disco:test:delete2'))
+        self.assert_("disco:test:delete2" in self.ddfs.list('disco:test:delete2'))
+
+    def tearDown(self):
+        self.ddfs.delete('disco:test:delete1')
+        self.ddfs.delete('disco:test:delete2', token='secret1')

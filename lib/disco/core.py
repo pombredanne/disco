@@ -14,7 +14,7 @@ from disco.error import DiscoError, JobError, CommError
 from disco.eventmonitor import EventMonitor
 from disco.job import Job
 from disco.settings import DiscoSettings
-
+from disco.util import proxy_url
 from disco.worker.classic.worker import Params # backwards compatibility XXX: deprecate
 
 class Continue(Exception):
@@ -31,8 +31,9 @@ class Disco(object):
     .. seealso:: :meth:`Disco.new_job` and :mod:`disco.job`
        for more on creating jobs.
     """
-    def __init__(self, master=None, settings=None):
+    def __init__(self, master=None, settings=None, proxy=None):
         self.settings = settings or DiscoSettings()
+        self.proxy  = proxy or self.settings['DISCO_PROXY']
         self.master = master or self.settings['DISCO_MASTER']
 
     def __repr__(self):
@@ -40,7 +41,7 @@ class Disco(object):
 
     def request(self, url, data=None, offset=0):
         try:
-            return download('%s%s' % (self.master, url),
+            return download(proxy_url('%s%s' % (self.master, url), proxy=self.proxy),
                             data=data,
                             offset=offset)
         except CommError, e:
@@ -379,8 +380,14 @@ def classic_iterator(urls,
     worker = Worker(map_reader=reader, map_input_stream=input_stream)
     settings = DiscoSettings(DISCO_MASTER=ddfs) if ddfs else DiscoSettings()
     for input in util.inputlist(urls, settings=settings):
-        notifier(input)
-        for record in Input(input, open=worker.opener('map', 'in', params)):
+        if isinstance(input, basestring):
+            dest = proxy_url(input, to_master=False)
+        elif isinstance(input, tuple):
+            dest = tuple([proxy_url(i, to_master=False) for i in input])
+        else:
+            dest = [proxy_url(i, to_master=False) for i in input]
+        notifier(dest)
+        for record in Input(dest, open=worker.opener('map', 'in', params)):
             yield record
 
 def result_iterator(*args, **kwargs):

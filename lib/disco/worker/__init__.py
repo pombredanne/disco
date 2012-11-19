@@ -98,6 +98,8 @@ class Worker(dict):
     :type  profile: bool
     :param profile: determines whether :meth:`run` will be profiled.
     """
+    stderr = sys.stderr
+
     def __init__(self, **kwargs):
         super(Worker, self).__init__(self.defaults())
         self.update(kwargs)
@@ -322,12 +324,12 @@ class Worker(dict):
         """
         try:
             sys.stdin = NonBlockingInput(sys.stdin, timeout=600)
-            sys.stdout = MessageWriter(cls)
-            cls.send('PID', os.getpid())
+            sys.stdout = sys.stderr = MessageWriter(cls)
+            cls.send('WORKER', {'pid': os.getpid(), 'version': "1.0"})
             task = cls.get_task()
             job, jobargs = task.jobobjs
             job.worker.start(task, job, **jobargs)
-            cls.send('END')
+            cls.send('DONE')
         except (DataError, EnvironmentError, MemoryError), e:
             # check the number of open file descriptors (under proc), warn if close to max
             # http://stackoverflow.com/questions/899038/getting-the-highest-allocated-file-descriptor
@@ -342,7 +344,7 @@ class Worker(dict):
     def send(cls, type, payload=''):
         from disco.json import dumps, loads
         body = dumps(payload)
-        sys.stderr.write('%s %d %s\n' % (type, len(body), body))
+        cls.stderr.write('%s %d %s\n' % (type, len(body), body))
         spent, rtype = sys.stdin.t_read_until(' ')
         spent, rsize = sys.stdin.t_read_until(' ', spent=spent)
         spent, rbody = sys.stdin.t_read(int(rsize) + 1, spent=spent)
@@ -359,13 +361,13 @@ class Worker(dict):
             raise Wait
         if status == 'failed':
             raise DataError("Can't handle broken input", id)
-        return replicas
+        return [(id, str(url)) for id, url in replicas]
 
     @classmethod
     def get_inputs(cls, done=False, exclude=()):
         while not done:
             done, inputs = cls.send('INPUT')
-            for id, status, urls in inputs:
+            for id, _status, _replicas in inputs:
                 if id not in exclude:
                     yield IDedInput((cls, id))
                     exclude += (id, )
@@ -444,18 +446,21 @@ class InputIter(object):
             self.last, item = self.iter.next()
             return item
         except DataError:
-            self.swap()
+            self.swap(traceback.format_exc())
             raise Wait(0)
 
-    def swap(self):
+    def swap(self, error=None):
         try:
             def skip(iter, N):
                 from itertools import dropwhile
                 return dropwhile(lambda (n, rec): n < N, enumerate(iter))
             self.iter = skip(self.open(self.urls.next()), self.last + 1)
         except DataError:
-            self.swap()
+            self.swap(traceback.format_exc())
         except StopIteration:
+            if error:
+                raise DataError("Exhausted all available replicas, "
+                                "last error was:\n\n%s" % error, self.input)
             raise DataError("Exhausted all available replicas", self.input)
 
 class Input(object):

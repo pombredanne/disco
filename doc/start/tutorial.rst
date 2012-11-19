@@ -57,7 +57,7 @@ You can try with a larger file to see that chunks are created as needed.
    Disco includes an `example`_ of how to do this,
    which should work unmodified for most use cases.
 
-.. _example: https://github.com/tuulos/disco/blob/master/examples/util/chunk.py
+.. _example: https://github.com/discoproject/disco/blob/master/examples/util/chunk.py
 
 2. Write job functions
 ----------------------
@@ -134,6 +134,9 @@ and prints out the results:
 
     .. literalinclude:: ../../examples/util/count_words.py
 
+.. note:: This example could also be written by extending :class:`disco.job.Job`.
+          See, for example, `examples/util/wordcount.py`.
+
 Now comes the moment of truth.
 
 Run the script as follows::
@@ -161,12 +164,15 @@ As you saw, creating a new Disco job is pretty straightforward.
 You could extend this simple example in any number of ways.
 For instance, by using the params object to include a list of stop words.
 
+You could continue on with :ref:`tutorial_2` which is intended as a
+follow-on tutorial to this one.
+
 If you pushed the data to :ref:`DDFS`,
 you could try changing the input to ``tag://data:bigtxt``,
 and add ``map_reader = disco.worker.classic.func.chain_reader``.
 
 You could follow the :ref:`discodb_tutorial`,
-to learn more about using :ref:`discodb <discodb>` with Disco.
+to learn more about using :mod:`discodb` with Disco.
 
 You could try using :func:`~disco.worker.classic.func.sum_combiner`,
 to make the job more efficient.

@@ -2,26 +2,58 @@
 -module(ddfs_tag).
 -behaviour(gen_server).
 
+-include("common_types.hrl").
 -include("config.hrl").
+-include("ddfs.hrl").
+-include("ddfs_gc.hrl").
 -include("ddfs_tag.hrl").
+-include("gs_util.hrl").
 
 -export([start/2, init/1, handle_call/3, handle_cast/2,
         handle_info/2, terminate/2, code_change/3]).
 
--type replica() :: {disco_util:timestamp(), nonempty_string()}.
 -type replyto() :: {pid(), reference()}.
 
--record(state, {tag :: tagname(),
+-record(state, {tag  :: tagname(),
                 data :: none |
                         {missing, notfound} |
                         {missing, deleted} |
                         {error, _} |
-                        {ok, #tagcontent{}},
-                delayed :: 'false' | gb_tree(),
+                        {ok, tagcontent()},
+                ddfs_data :: path(),
                 timeout :: non_neg_integer(),
-                replicas :: 'false' | 'too_many_failed_nodes'
-                    | [{replica(), node()}],
-                url_cache :: 'false' | gb_set()}).
+                delayed   = false :: false | gb_tree(),
+                replicas  = false :: false | [node()],
+                locations = false :: false | [url()],
+                url_cache = false :: false | gb_set()}).
+-type state() :: #state{}.
+
+% API messages.
+-type get_msg() :: {get, attrib() | all, token()}.
+-type put_msg() :: {put, attrib(), string(), token()}.
+-type update_msg() :: {update, [url()], token(), proplists:proplist()}.
+-type delayed_update_msg() :: {delayed_update, [url()], token(), proplists:proplist()}.
+-type delete_attrib_msg()  :: {delete_attrib, attrib(), token()}.
+-type delete_msg() :: {delete, token()}.
+
+% Special msg for GC.
+-type gc_get_msg() :: gc_get.
+
+% Special messages for the +deleted tag.
+-type has_tagname_msg() :: {has_tagname, tagname()}.
+-type get_tagnames_msg() :: get_tagnames.
+-type delete_tagname_msg() :: {delete_tagname, tagname()}.
+
+% Notifications.
+-type notify_msg() :: {notify, term()}.
+
+-type call_msg() :: get_msg() | put_msg() | update_msg() | delayed_update_msg()
+                  | delete_attrib_msg() | delete_msg()
+                  | has_tagname_msg() | get_tagnames_msg() | delete_tagname_msg()
+                  | gc_get_msg().
+-type cast_msg() :: notify_msg().
+
+-export_type([call_msg/0, cast_msg/0]).
 
 % THOUGHT: Eventually we want to partition tag keyspace instead
 % of using a single global keyspace. This can be done relatively
@@ -34,27 +66,33 @@
 % Correspondingly GC'ing must ensure that K replicas for a tag
 % are found within its partition rather than globally.
 
--spec start(tagname(), bool()) -> 'ignore' | {'error',_} | {'ok',pid()}.
+-spec start(tagname(), boolean()) -> ignore | {error,_} | {ok,pid()}.
 start(TagName, NotFound) ->
-    gen_server:start(ddfs_tag, {TagName, NotFound}, []).
+    gen_server:start(?MODULE, {TagName, NotFound}, []).
 
--spec init({tagname(), bool()}) -> {'ok', #state{}}.
+-spec init({tagname(), boolean()}) -> gs_init().
 init({TagName, true}) ->
     init(TagName, {missing, notfound}, ?TAG_EXPIRES_ONERROR);
 init({TagName, false}) ->
     init(TagName, none, ?TAG_EXPIRES).
 
--spec init(tagname(), none | {missing, notfound},
-            non_neg_integer()) -> {'ok', #state{}}.
+-spec init(tagname(), none | {missing, notfound}, non_neg_integer()) -> gs_init().
 init(TagName, Data, Timeout) ->
     put(min_tagk, list_to_integer(disco:get_setting("DDFS_TAG_MIN_REPLICAS"))),
     put(tagk, list_to_integer(disco:get_setting("DDFS_TAG_REPLICAS"))),
+    put(blobk, list_to_integer(disco:get_setting("DDFS_BLOB_REPLICAS"))),
     {ok, #state{tag = TagName,
                 data = Data,
-                delayed = false,
-                replicas = false,
-                url_cache = false,
+                ddfs_data = disco:get_setting("DDFS_DATA"),
                 timeout = Timeout}}.
+
+-type msg() :: call_msg()
+               %% internal messages:
+             | gc_get0.
+
+-type notify() :: notify_msg()
+                  %% internal messages:
+                | {notify0, term()}.
 
 %%% Note to the reader!
 %%%
@@ -63,49 +101,56 @@ init(TagName, Data, Timeout) ->
 %%% machine is to follow the logic from the top to the bottom.
 %%%
 
+-spec handle_cast({msg(), from()} | {die, none} | notify(), state())
+                 -> gs_noreply() | gs_stop(normal).
 % We don't want to cache requests made by garbage collector
 handle_cast({gc_get, ReplyTo}, #state{data = none} = S) ->
     handle_cast({gc_get0, ReplyTo}, S#state{timeout = 100});
+handle_cast({notify, M}, #state{data = none} = S) ->
+    handle_cast({notify0, M}, S#state{timeout = 100});
 
 % On the other hand, if tag is already cached, GC'ing should
 % not trash it
 handle_cast({gc_get, ReplyTo}, S) ->
     handle_cast({gc_get0, ReplyTo}, S);
+handle_cast({notify, M}, S) ->
+    handle_cast({notify0, M}, S);
 
 % First request for this tag: No tag data loaded - load it
-handle_cast(M, #state{data = none} = S) ->
-    {Data, Replicas, Timeout} =
-        case is_tag_deleted(S#state.tag) of
+handle_cast(M, #state{data = none, tag = Tag, timeout = TO,
+                      ddfs_data = DdfsData} = S) ->
+    {Data, Replicas, Locations, Timeout} =
+        case is_tag_deleted(Tag) of
             true ->
-                {{missing, deleted}, false, ?TAG_EXPIRES_ONERROR};
+                {{missing, deleted}, false, false, ?TAG_EXPIRES_ONERROR};
             false ->
-                case get_tagdata(S#state.tag) of
-                    {ok, TagData, Repl} ->
+                case get_tagdata(Tag, DdfsData) of
+                    {ok, TagData, Repl, Locs} ->
                         case ddfs_tag_util:decode_tagcontent(TagData) of
                             {ok, Content} ->
-                                {{ok, Content}, Repl, S#state.timeout};
+                                {{ok, Content}, Repl, Locs, TO};
                             {error, _} = E ->
-                                {E, false, ?TAG_EXPIRES_ONERROR}
+                                {E, false, false, ?TAG_EXPIRES_ONERROR}
                         end;
-                    {missing, notfound} = E->
-                        {E, false, ?TAG_EXPIRES_ONERROR};
+                    {missing, notfound} = E ->
+                        {E, false, false, ?TAG_EXPIRES_ONERROR};
                     {error, _} = E ->
-                        {E, false, ?TAG_EXPIRES_ONERROR}
+                        {E, false, false, ?TAG_EXPIRES_ONERROR}
                 end;
             {error, _} = E ->
-                {E, false, ?TAG_EXPIRES_ONERROR}
+                {E, false, false, ?TAG_EXPIRES_ONERROR}
         end,
-    handle_cast(M, S#state{
-                data = Data,
-                replicas = Replicas,
-                timeout = lists:min([Timeout, S#state.timeout])});
+    handle_cast(M, S#state{data      = Data,
+                           replicas  = Replicas,
+                           locations = Locations,
+                           timeout   = lists:min([Timeout, TO])});
 
 % Delayed update with an empty buffer, initialize the buffer and a flush process
 handle_cast({{delayed_update, _, _, _}, _} = M,
-            #state{data = {ok, _}, delayed = false} = S) ->
+            #state{data = {ok, _}, delayed = false, tag = Tag} = S) ->
     spawn(fun() ->
         timer:sleep(?DELAYED_FLUSH_INTERVAL),
-        ddfs:get_tag(ddfs_master, binary_to_list(S#state.tag), all, internal)
+        ddfs:get_tag(ddfs_master, binary_to_list(Tag), all, internal)
     end),
     handle_cast(M, S#state{delayed = gb_trees:empty()});
 
@@ -151,40 +196,44 @@ handle_cast({{get, Attrib, Token}, ReplyTo}, #state{data = {ok, D}} = S) ->
     S1 = authorize(read, Token, ReplyTo, S, Do),
     {noreply, S1, S1#state.timeout};
 
-handle_cast({{get, _, _}, ReplyTo}, S) ->
-    gen_server:reply(ReplyTo, S#state.data),
-    {noreply, S, S#state.timeout};
+handle_cast({{get, _, _}, ReplyTo}, #state{data = Data, timeout = TO} = S) ->
+    gen_server:reply(ReplyTo, Data),
+    {noreply, S, TO};
 
-handle_cast({_, ReplyTo}, #state{data = {error, _}} = S) ->
-    gen_server:reply(ReplyTo, S#state.data),
-    {noreply, S, S#state.timeout};
+handle_cast({_, ReplyTo}, #state{data = {error, _} = Data, timeout = TO} = S) ->
+    gen_server:reply(ReplyTo, Data),
+    {noreply, S, TO};
 
-handle_cast({gc_get0, ReplyTo}, #state{data = {ok, D}} = S) ->
-    R = {D#tagcontent.id, D#tagcontent.urls, S#state.replicas},
+handle_cast({gc_get0, ReplyTo},
+            #state{data = {ok, D}, replicas = Replicas, timeout = TO} = S) ->
+    R = {D#tagcontent.id, D#tagcontent.urls, Replicas},
     gen_server:reply(ReplyTo, R),
-    {noreply, S, S#state.timeout};
+    {noreply, S, TO};
 
-handle_cast({gc_get0, ReplyTo}, S) ->
-    gen_server:reply(ReplyTo, {S#state.data, S#state.replicas}),
-    {noreply, S, S#state.timeout};
+handle_cast({gc_get0, ReplyTo}, #state{data = Data,
+                                       replicas = Replicas,
+                                       timeout = TO} = S) ->
+    gen_server:reply(ReplyTo, {Data, Replicas}),
+    {noreply, S, TO};
 
 handle_cast({{update, Urls, Token, Opt}, ReplyTo}, S) ->
     Do = fun(TokenInfo) -> do_update(TokenInfo, Urls, Opt, ReplyTo, S) end,
     S1 = authorize(write, Token, ReplyTo, S, Do),
     {noreply, S1, S1#state.timeout};
 
-handle_cast({{put, Field, Value, Token}, ReplyTo}, S) ->
+handle_cast({{put, Field, Value, Token}, ReplyTo}, #state{timeout = TO} = S) ->
     case ddfs_tag_util:validate_value(Field, Value) of
         true ->
             Do =
                 fun (TokenInfo) ->
-                    do_put(TokenInfo, Field, Value, ReplyTo, S)
+                    S1 = do_put(TokenInfo, Field, Value, ReplyTo, S),
+                    S1#state{url_cache = false}
                 end,
             S1 = authorize(write, Token, ReplyTo, S, Do),
             {noreply, S1, S1#state.timeout};
         false ->
             _ = send_replies(ReplyTo, {error, invalid_attribute_value}),
-            {noreply, S, S#state.timeout}
+            {noreply, S, TO}
     end;
 
 handle_cast({{delete_attrib, Field, Token}, ReplyTo},
@@ -193,9 +242,14 @@ handle_cast({{delete_attrib, Field, Token}, ReplyTo},
     S1 = authorize(write, Token, ReplyTo, S, Do),
     {noreply, S1, S1#state.timeout};
 
-handle_cast({{delete_attrib, _Field, _Token}, ReplyTo}, S) ->
+handle_cast({{delete_attrib, _Field, _Token}, ReplyTo},
+            #state{timeout = TO} = S) ->
     _ = send_replies(ReplyTo, {error, unknown_attribute}),
-    {noreply, S, S#state.timeout};
+    {noreply, S, TO};
+
+handle_cast({notify0, {gc_rr_update, Updates, Blacklist, UpdateId}}, S) ->
+    S1 = do_gc_rr_update(S, Updates, Blacklist, UpdateId),
+    {noreply, S1, S1#state.timeout};
 
 % Special operations for the +deleted metatag
 
@@ -206,39 +260,56 @@ handle_cast(M, #state{url_cache = false, data = {ok, Data}} = S) ->
     Urls = Data#tagcontent.urls,
     handle_cast(M, S#state{url_cache = init_url_cache(Urls)});
 
-handle_cast({{has_tagname, Name}, ReplyTo}, #state{url_cache = Cache} = S) ->
+handle_cast({{has_tagname, Name}, ReplyTo},
+            #state{url_cache = Cache, timeout = TO} = S) ->
     gen_server:reply(ReplyTo, gb_sets:is_member(Name, Cache)),
-    {noreply, S, S#state.timeout};
+    {noreply, S, TO};
 
-handle_cast({get_tagnames, ReplyTo}, #state{url_cache = Cache} = S) ->
+handle_cast({get_tagnames, ReplyTo},
+            #state{url_cache = Cache, timeout = TO} = S) ->
     gen_server:reply(ReplyTo, {ok, Cache}),
-    {noreply, S, S#state.timeout};
+    {noreply, S, TO};
 
 handle_cast({{delete_tagname, Name}, ReplyTo}, #state{url_cache = Cache} = S) ->
-    NewDel = gb_sets:delete_any(Name, Cache),
-    NewUrls = [[<<"tag://", Tag/binary>>] || Tag <- gb_sets:to_list(NewDel)],
-    handle_cast({{put, urls, NewUrls, internal}, ReplyTo}, S).
+    S1 = case gb_sets:is_member(Name, Cache) of
+             true ->
+                 NewDel = gb_sets:delete_any(Name, Cache),
+                 NewUrls = [[<<"tag://", Tag/binary>>]
+                            || Tag <- gb_sets:to_list(NewDel)],
+                 do_put({write, null},
+                        urls,
+                        NewUrls,
+                        ReplyTo,
+                        S#state{url_cache = NewDel});
+             false ->
+                 S
+         end,
+    {noreply, S1, S1#state.timeout}.
 
+-spec handle_call(term(), from(), state()) -> gs_reply(ok | state()).
 handle_call(dbg_get_state, _, S) ->
     {reply, S, S};
 
 handle_call(_, _, S) -> {reply, ok, S}.
 
+-spec handle_info(timeout, state()) -> gs_noreply_t() | gs_stop(normal);
+                 ({reference(), term()}, state()) -> gs_noreply().
 handle_info(timeout, S) ->
     handle_cast({die, none}, S);
-
 % handle late replies to "catch gen_server:call"
 handle_info({Ref, _Msg}, S) when is_reference(Ref) ->
     {noreply, S}.
 
 % callback stubs
-terminate(_Reason, _State) -> {}.
+-spec terminate(term(), state()) -> ok.
+terminate(_Reason, _State) -> ok.
 
+-spec code_change(term(), state(), term()) -> {ok, state()}.
 code_change(_OldVsn, State, _Extra) -> {ok, State}.
 
 
--spec authorize(tokentype(), binary(), replyto(), #state{},
-                fun((tokentype()) -> #state{})) -> #state{}.
+-spec authorize(tokentype(), binary(), replyto(), state(),
+                fun((tokentype()) -> state())) -> state().
 authorize(TokenType,
           Token,
           ReplyTo,
@@ -260,71 +331,199 @@ authorize(TokenType, Token, ReplyTo, ReadToken, WriteToken, S, Op) ->
     end.
 
 do_update(TokenInfo, Urls, Opt, ReplyTo, #state{data = {missing, _}} = S) ->
-    do_update(TokenInfo, Urls, Opt, ReplyTo, [], S);
+    do_update(TokenInfo, Urls, Opt, ReplyTo, missing, S);
 
 do_update(TokenInfo, Urls, Opt, ReplyTo, #state{data = {ok, D}} = S) ->
     OldUrls = D#tagcontent.urls,
     do_update(TokenInfo, Urls, Opt, ReplyTo, OldUrls, S).
 
-do_update(TokenInfo, Urls, Opt, ReplyTo, OldUrls, S) ->
+do_update(TokenInfo, Urls, Opt, ReplyTo, OldUrls,
+          #state{url_cache = OldCache, locations = TagUrls} = S) ->
     case ddfs_tag_util:validate_urls(Urls) of
         true ->
             NoDup = proplists:is_defined(nodup, Opt),
-            {Cache, Merged} = merge_urls(Urls,
-                                         OldUrls,
-                                         NoDup,
-                                         S#state.url_cache),
-            NState = do_put(TokenInfo, urls, Merged, ReplyTo, S),
-            NState#state{url_cache = Cache};
+            {Updated, Cache, Merged} = merge_urls(Urls,
+                                                  OldUrls,
+                                                  NoDup,
+                                                  OldCache),
+            case Updated of
+                true ->
+                    do_put(TokenInfo,
+                           urls,
+                           Merged,
+                           ReplyTo,
+                           S#state{url_cache = Cache});
+                false ->
+                    _ = send_replies(ReplyTo, {ok, TagUrls}),
+                    S#state{url_cache = Cache}
+            end;
         false ->
             _ = send_replies(ReplyTo, {error, invalid_url_object}),
             S
     end.
 
-% Normal update: Just add new urls to the list
+% Avoid creating new tag incarnations when there is no modification,
+% otherwise we just create pointless garbage that needs cleaning.  But
+% ensure that any new tags are created, even if empty.
+
+% Normal update: Just add new urls to the list.
+merge_urls(NewUrls, missing, false, _Cache) ->
+    {true, false, NewUrls};
+merge_urls([], OldUrls, false, _Cache) ->
+    {false, false, OldUrls};
 merge_urls(NewUrls, OldUrls, false, _Cache) ->
-    {false, NewUrls ++ OldUrls};
+    {true, false, NewUrls ++ OldUrls};
 
 % Set update (nodup): Remove duplicates.
 %
 % Note that merge_urls should keep the original order of
 % both NewUrls and OldUrls list. It should drop entries from
 % NewUrls that are duplicates or already exist in OldUrls.
+merge_urls([] = NewUrls, missing, true, _Cache) ->
+    % This is a special case: an empty update to a non-existent tag
+    % should create the tag.
+    {true, init_url_cache(NewUrls), NewUrls};
+merge_urls(NewUrls, missing, true, _Cache) ->
+    find_unseen(NewUrls, init_url_cache([]), [], false);
 merge_urls(NewUrls, OldUrls, true, false) ->
     merge_urls(NewUrls, OldUrls, true, init_url_cache(OldUrls));
 
 merge_urls(NewUrls, OldUrls, true, Cache) ->
-    find_unseen(NewUrls, Cache, OldUrls).
+    find_unseen(NewUrls, Cache, OldUrls, false).
 
-find_unseen([], Seen, Urls) ->
-    {Seen, Urls};
-find_unseen([[Url|_] = Repl|Rest], Seen, Urls) ->
+find_unseen([], Seen, Urls, Updated) ->
+    {Updated, Seen, Urls};
+find_unseen([[Url|_] = Repl|Rest], Seen, Urls, Updated) ->
     Name = ddfs_util:url_to_name(Url),
     case {Name, gb_sets:is_member(Name, Seen)} of
         {false, _} ->
-            find_unseen(Rest, Seen, [Repl|Urls]);
+            find_unseen(Rest, Seen, [Repl|Urls], true);
         {_, false} ->
-            find_unseen(Rest, gb_sets:add(Name, Seen), [Repl|Urls]);
+            find_unseen(Rest, gb_sets:add(Name, Seen), [Repl|Urls], true);
         {_, true} ->
-            find_unseen(Rest, Seen, Urls)
+            find_unseen(Rest, Seen, Urls, Updated)
     end.
 
 init_url_cache(Urls) ->
     gb_sets:from_list([ddfs_util:url_to_name(Url) || [Url|_] <- Urls]).
 
 -spec send_replies(replyto() | [replyto()],
-                   {'error', 'commit_failed' | 'invalid_attribute_value' |
-                             'invalid_url_object' | 'unknown_attribute' |
-                             'replication_failed' | 'unauthorized'} |
-                   {'ok', [binary(),...]} | 'ok') -> [any()].
+                   {error, commit_failed | invalid_attribute_value |
+                           invalid_url_object | unknown_attribute |
+                           replication_failed | unauthorized} |
+                   {ok, [url()]} | ok) -> [any()].
 send_replies(ReplyTo, Message) when is_tuple(ReplyTo) ->
     send_replies([ReplyTo], Message);
 send_replies(ReplyToList, Message) ->
     [gen_server:reply(Re, Message) || Re <- ReplyToList].
 
--spec get_tagdata(tagname()) -> {'missing', 'notfound'} | {'error', _}
-                             | {'ok', binary(), [{replica(), node()}]}.
-get_tagdata(TagName) ->
+-spec do_gc_rr_update(state(), [blob_update()], [node()], tagid()) -> state().
+do_gc_rr_update(#state{data = {missing, _}} = S, _Updates, _Blacklist, _Id) ->
+    % The tag has been deleted, or cannot be found; ignore the update.
+    S;
+do_gc_rr_update(#state{data = {error, _}} = S, _Updates, _Blacklist, _Id) ->
+    % Error retrieving tag data; ignore the update.
+    S;
+do_gc_rr_update(#state{tag = TagName, data = {ok, D} = Tag} = S,
+                Updates, Blacklist, UpdateId) ->
+    OldUrls = D#tagcontent.urls,
+    Id = D#tagcontent.id,
+    Map = gb_trees:from_orddict(lists:sort(Updates)),
+    NewUrls = gc_update_urls(Id, OldUrls, Map, Blacklist, UpdateId),
+    {ok, NewTagContent} =
+        ddfs_tag_util:update_tagcontent(TagName, urls, NewUrls, Tag, null),
+    NewTagData = ddfs_tag_util:encode_tagcontent(NewTagContent),
+    TagId = NewTagContent#tagcontent.id,
+    case put_distribute({TagId, NewTagData}) of
+        {ok, DestNodes, DestUrls} ->
+            S#state{data = {ok, NewTagContent},
+                    replicas = DestNodes,
+                    locations = DestUrls,
+                    url_cache = init_url_cache(NewUrls)};
+        {error, _} = E ->
+            lager:error("GC: unable to update tag ~p: ~p", [TagName, E]),
+            S
+    end.
+
+-spec gc_update_urls(tagid(), [[url()]], gb_tree(), [node()], tagid())
+                    -> [[url()]].
+gc_update_urls(Id, OldUrls, Map, Blacklist, UpdateId) ->
+    gc_update_urls(Id, OldUrls, Map, Blacklist, UpdateId, []).
+gc_update_urls(_Id, [], _Map, _Blacklist, _UpdateId, Acc) ->
+    lists:reverse(Acc);
+gc_update_urls(Id, [[] | Rest], Map, Blacklist, UpdateId, Acc) ->
+    gc_update_urls(Id, Rest, Map, Blacklist, UpdateId, Acc);
+gc_update_urls(Id, [[Url|_] = BlobSet | Rest], Map, Blacklist, UpdateId, Acc) ->
+    case ddfs_util:parse_url(Url) of
+        not_ddfs ->
+            gc_update_urls(Id, Rest, Map, Blacklist, UpdateId, [BlobSet|Acc]);
+        {_, _, _, _, BlobName} ->
+            case gb_trees:lookup(BlobName, Map) of
+                none ->
+                    gc_update_urls(Id, Rest, Map, Blacklist, UpdateId, [BlobSet|Acc]);
+                {value, filter}
+                  when Id =:= UpdateId ->
+                    % Only apply the blacklist filter provided we
+                    % still retain at least the minimum number of
+                    % replicas.  This is just a sanity check; the real
+                    % safety check is done by GC/RR.
+                    Filtered = filter_blacklist(BlobSet, Blacklist),
+                    case length(Filtered) >= get(blobk) of
+                        true ->
+                            gc_update_urls(Id, Rest, Map, Blacklist, UpdateId, [Filtered|Acc]);
+                        false ->
+                            gc_update_urls(Id, Rest, Map, Blacklist, UpdateId, [BlobSet|Acc])
+                    end;
+                {value, filter} ->
+                    % The tag was modified after the filter safety
+                    % check was done; skip the update.
+                    gc_update_urls(Id, Rest, Map, Blacklist, UpdateId, [BlobSet|Acc]);
+                {value, NewUrls_} ->
+                    % Ensure that new locations use the same scheme as
+                    % the existing locations.
+                    NewUrls = rewrite_scheme(Url, NewUrls_),
+                    NewBlobSet = lists:usort(NewUrls ++ BlobSet),
+                    gc_update_urls(Id, Rest, Map, Blacklist, UpdateId, [NewBlobSet|Acc])
+            end
+    end.
+
+-spec rewrite_scheme(url(), [url()]) -> [url()].
+rewrite_scheme(OrigUrl, Urls) ->
+    {S, _, _, _, _} = mochiweb_util:urlsplit(binary_to_list(OrigUrl)),
+    [rewrite_url(U, S) || U <- Urls].
+
+rewrite_url(Url, S) ->
+    U1 = binary_to_list(Url),
+    {_, H, P, Q, F} = mochiweb_util:urlsplit(U1),
+    NewUrl = mochiweb_util:urlunsplit({S, H, P, Q, F}),
+    list_to_binary(NewUrl).
+
+-spec filter_blacklist([url()], [node()]) -> [url()].
+filter_blacklist(BlobSet, Blacklist) ->
+    lists:foldl(
+      fun(Url, Acc) ->
+              case ddfs_util:parse_url(Url) of
+                  not_ddfs -> [Url | Acc];
+                  {Host, _V, _T, _H, _B} ->
+                      case disco:slave_safe(Host) of
+                          false -> [Url | Acc];
+                          Node -> case lists:member(Node, Blacklist) of
+                                      true -> Acc;
+                                      false -> [Url|Acc]
+                                  end
+                      end
+              end
+      end, [], BlobSet).
+
+location_url(TagId, Node, DdfsData, Vol) ->
+    Host = disco:host(Node),
+    DdfsRoot = disco:ddfs_root(DdfsData, Host),
+    {ok, _, Url} = ddfs_util:hashdir(TagId, Host, "tag", DdfsRoot, Vol),
+    Url.
+
+-spec get_tagdata(tagname(), path()) -> {missing, notfound} | {error, _}
+                                            | {ok, tagname(), [node()], [url()]}.
+get_tagdata(TagName, DdfsData) ->
     {ok, ReadableNodes, RBSize} = ddfs_master:get_read_nodes(),
     TagMinK = get(min_tagk),
     case RBSize >= TagMinK of
@@ -345,27 +544,31 @@ get_tagdata(TagName) ->
                     {{Time, _Vol}, _Node} = lists:max(L),
                     Replicas = [X || {{T, _}, _} = X <- L, T == Time],
                     TagID = ddfs_util:pack_objname(TagName, Time),
-                    read_tagdata(TagID, Replicas, [], tagdata_failed)
+                    Locations = [location_url(TagID, Node, DdfsData, Vol)
+                                 || {{_, Vol}, Node} <- Replicas],
+                    read_tagdata(TagID, Locations, Replicas, [], tagdata_failed)
             end
     end.
 
-read_tagdata(_TagID, Replicas, Failed, Error)
-             when length(Replicas) =:= length(Failed) ->
+read_tagdata(_TagID, _Locations, Replicas, Failed, Error)
+  when length(Replicas) =:= length(Failed) ->
     {error, Error};
 
-read_tagdata(TagID, Replicas, Failed, _Error) ->
-    {TagNfo, SrcNode} = Chosen = ddfs_util:choose_random(Replicas -- Failed),
-    case catch gen_server:call({ddfs_node, SrcNode},
-            {get_tag_data, TagID, TagNfo}, ?NODE_TIMEOUT) of
+read_tagdata(TagID, Locations, Replicas, Failed, _Error) ->
+    {TagNfo, SrcNode} = Chosen = disco_util:choose_random(Replicas -- Failed),
+    GetData = try ddfs_node:get_tag_data(SrcNode, TagID, TagNfo)
+              catch K:V -> {error, {K,V}}
+              end,
+    case GetData of
         {ok, Data} ->
             {_, DestNodes} = lists:unzip(Replicas),
-            {ok, Data, DestNodes};
+            {ok, Data, DestNodes, Locations};
         E ->
-            read_tagdata(TagID, Replicas, [Chosen|Failed], E)
+            read_tagdata(TagID, Locations, Replicas, [Chosen|Failed], E)
     end.
 
--spec do_delayed_update([[binary()]], [term()], replyto(),
-                        gb_tree(), #state{}) -> #state{}.
+-spec do_delayed_update([[url()]], [term()], replyto(), gb_tree(), state())
+                       -> state().
 do_delayed_update(Urls, Opt, ReplyTo, Buffer, S) ->
     % We must handle updates with different set of options separately.
     % Thus requests are indexed by the normalized set of options (OptKey)
@@ -392,7 +595,7 @@ jsonbin(X) ->
     iolist_to_binary(mochijson2:encode(X)).
 
 -spec do_get({tokentype(), token()}, attrib() | all, tagcontent()) ->
-             {'ok', binary()} | {'error','unauthorized' | 'unknown_attribute'}.
+             {ok, binary()} | {error, unauthorized | unknown_attribute}.
 do_get(_TokenInfo, all, D) ->
     {ok, ddfs_tag_util:encode_tagcontent_secure(D)};
 
@@ -414,27 +617,14 @@ do_get(_TokenInfo, {user, A}, D) ->
         _ -> {error, unknown_attribute}
     end.
 
-% First, a special case: New tag is being created and a token is set ->
-% Assign the token as a read and write token for the new tag atomically.
-
--spec do_put({tokentype(), token()}, attrib(), string(), replyto(), #state{})
-            -> #state{}.
+-spec do_put({tokentype(), token()}, attrib(), string(), replyto(), state())
+            -> state().
 do_put({_, Token},
        Field,
        Value,
        ReplyTo,
-       #state{tag = TagName, data = {missing, _} = D} = S)
-       when is_binary(Token) ->
-    D1 = ddfs_tag_util:update_tagcontent(TagName, read_token, Token, D),
-    D2 = ddfs_tag_util:update_tagcontent(TagName, write_token, Token, D1),
-    do_put(Field, Value, ReplyTo, S#state{data = D2});
-
-do_put(_TokenInfo, Field, Value, ReplyTo, S) ->
-    do_put(Field, Value, ReplyTo, S).
-
--spec do_put(attrib(), string(), replyto(), #state{}) -> #state{}.
-do_put(Field, Value, ReplyTo, #state{tag = TagName, data = TagData} = S) ->
-    case ddfs_tag_util:update_tagcontent(TagName, Field, Value, TagData) of
+       #state{tag = TagName, data = TagData} = S) ->
+    case ddfs_tag_util:update_tagcontent(TagName, Field, Value, TagData, Token) of
         {ok, TagContent} ->
             NewTagData = ddfs_tag_util:encode_tagcontent(TagContent),
             TagID = TagContent#tagcontent.id,
@@ -448,14 +638,14 @@ do_put(Field, Value, ReplyTo, #state{tag = TagName, data = TagData} = S) ->
                     _ = send_replies(ReplyTo, {ok, DestUrls}),
                     S#state{data = {ok, TagContent},
                             replicas = DestNodes,
-                            url_cache = false};
+                            locations = DestUrls};
                 {error, _} = E ->
                     _ = send_replies(ReplyTo, E),
                     S#state{url_cache = false}
             end;
         {error, _} = E ->
             _ = send_replies(ReplyTo, E),
-            S
+            S#state{url_cache = false}
     end.
 
 do_delete_attrib(Field, ReplyTo, #state{tag = TagName, data = {ok, D}} = S) ->
@@ -463,14 +653,14 @@ do_delete_attrib(Field, ReplyTo, #state{tag = TagName, data = {ok, D}} = S) ->
     NewTagData = ddfs_tag_util:encode_tagcontent(TagContent),
     TagId = TagContent#tagcontent.id,
     case put_distribute({TagId, NewTagData}) of
-        {ok, DestNodes, _DestUrls} ->
+        {ok, DestNodes, DestUrls} ->
             _ = send_replies(ReplyTo, ok),
             S#state{data = {ok, TagContent},
                     replicas = DestNodes,
-                    url_cache = false};
+                    locations = DestUrls};
         {error, _} = E ->
             _ = send_replies(ReplyTo, E),
-            S#state{url_cache = false}
+            S
     end.
 
 % Put transaction:
@@ -482,8 +672,9 @@ do_delete_attrib(Field, ReplyTo, #state{tag = TagName, data = {ok, D}} = S) ->
 % 6. if all fail, fail
 % 7. if at least one multicall succeeds, return updated tagdata, desturls
 
--spec put_distribute({tagid(),binary()}) ->
-    {'error','commit_failed' | 'replication_failed'} | {'ok',[node()],[binary()]}.
+-spec put_distribute({tagid(), binary()})
+                    -> {error, commit_failed | replication_failed}
+                           | {ok, [node()], [url(), ...]}.
 put_distribute({TagID, _} = Msg) ->
     case put_distribute(Msg, get(tagk), [], []) of
         {ok, TagVol} ->
@@ -493,8 +684,9 @@ put_distribute({TagID, _} = Msg) ->
     end.
 
 -spec put_distribute({tagid(), binary()}, non_neg_integer(),
-    [{node(), binary()}], [node()]) ->
-        {error, replication_failed} | {ok, [{node(), binary()}]}.
+                     [{node(), volume_name()}], [node()])
+                    -> {error, replication_failed}
+                           | {ok, [{node(), volume_name()}]}.
 put_distribute(_, K, OkNodes, _Exclude) when K == length(OkNodes) ->
     {ok, OkNodes};
 
@@ -519,8 +711,8 @@ put_distribute({TagID, TagData} = Msg, K, OkNodes, Exclude) ->
                            Exclude ++ [Node || {Node, _} <- Replies] ++ Failed)
     end.
 
--spec put_commit(tagid(), [{node(), binary()}]) ->
-    {'error', 'commit_failed'} | {'ok', [node()], [binary(), ...]}.
+-spec put_commit(tagid(), [{node(), volume_name()}])
+                -> {error, commit_failed} | {ok, [node()], [url(), ...]}.
 put_commit(TagID, TagVol) ->
     {Nodes, _} = lists:unzip(TagVol),
     {NodeUrls, _} = gen_server:multi_call(Nodes,
@@ -531,12 +723,14 @@ put_commit(TagID, TagVol) ->
         [] ->
             {error, commit_failed};
         Urls ->
+            lager:info("Updated tag ~p (at ~p locations)",
+                       [TagID, length(Urls)]),
             {ok, Nodes, Urls}
     end.
 
--spec do_delete(replyto(), #state{}) -> #state{}.
-do_delete(ReplyTo, S) ->
-    case add_to_deleted(S#state.tag) of
+-spec do_delete(replyto(), state()) -> state().
+do_delete(ReplyTo, #state{tag = Tag} = S) ->
+    case add_to_deleted(Tag) of
         {ok, _} ->
             gen_server:reply(ReplyTo, ok),
             gen_server:cast(self(), {die, none});
