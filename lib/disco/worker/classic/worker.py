@@ -44,6 +44,12 @@ class Worker(worker.Worker):
     :param map_init: initialization function for the map task.
                      This function is called once before the task starts.
 
+                     .. deprecated:: 0.4
+                                *map_init* has not been needed ever since
+                                :func:`InputStreams <disco.worker.classic.func.InputStream>`
+                                were introduced.
+                                Use *map_input_stream* and/or *map_reader* instead.
+
     :type  map_input_stream: sequence of :func:`disco.worker.classic.func.input_stream`
     :param map_input_stream: The given functions are chained together and the final resulting
                              :class:`disco.worker.classic.func.InputStream` object is used
@@ -89,6 +95,12 @@ class Worker(worker.Worker):
     :type  reduce_init: :func:`disco.worker.classic.func.init`
     :param reduce_init: initialization function for the reduce task.
                         This function is called once before the task starts.
+
+                     .. deprecated:: 0.4
+                                *reduce_init* has not been needed ever since
+                                :func:`InputStreams <disco.worker.classic.func.InputStream>`
+                                were introduced.
+                                Use *reduce_input_stream* and/or *reduce_reader* instead.
 
     :type  reduce_input_stream: sequence of :func:`disco.worker.classic.func.output_stream`
     :param reduce_input_stream: The given functions are chained together and the last
@@ -212,12 +224,18 @@ class Worker(worker.Worker):
                          'required_files': {},
                          'required_modules': None,
                          'ext_params': {},
-                         'params': None,
+                         'params': Params(),
                          'sort': False,
                          'sort_buffer_size': '10%',
                          'status_interval': 100000,
                          'version': '.'.join(str(s) for s in sys.version_info[:2])})
         return defaults
+
+    def jobenvs(self, job, **jobargs):
+        envs = super(Worker, self).jobenvs(job, **jobargs)
+        envs['LD_LIBRARY_PATH'] = 'lib'
+        envs['PYTHONPATH'] = ':'.join(('lib', envs.get('PYTHONPATH', '')))
+        return envs
 
     def jobzip(self, job, **jobargs):
         from disco.util import iskv
@@ -230,14 +248,14 @@ class Worker(worker.Worker):
                     jobzip.writestr(path, bytes)
         else:
             for path in get('required_files'):
-                jobzip.writepath(path)
+                jobzip.write(path, os.path.join('lib', os.path.basename(path)))
         if get('required_modules') is None:
             self['required_modules'] = find_modules([obj
                                                      for key in self
                                                      for obj in util.iterify(get(key))
                                                      if callable(obj)],
                                                     exclude=['Task'])
-        for mod in get('required_modules') or ():
+        for mod in get('required_modules'):
             if iskv(mod):
                 jobzip.writepath(mod[1])
         for func in ('map', 'reduce'):
@@ -259,7 +277,7 @@ class Worker(worker.Worker):
             self[task.mode] = external.prepare(params, task.mode)
 
         globals_ = globals().copy()
-        for module in self['required_modules'] or ():
+        for module in self['required_modules']:
             name = module[0] if util.iskv(module) else module
             globals_[name.split('.')[-1]] = __import__(name, fromlist=[name])
         for obj in util.flatten(self.values()):
@@ -398,7 +416,7 @@ def put(*args, **kwargs):
     return Task.put(*args, **kwargs)
 
 def this_inputs():
-    """Returns the inputs for the :ref:`worker`."""
+    """Returns the inputs for the :term:`worker`."""
     return [[url for rid, url in i.replicas] for i in Worker.get_inputs()]
 
 def this_name():

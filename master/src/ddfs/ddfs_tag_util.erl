@@ -1,15 +1,16 @@
 -module(ddfs_tag_util).
 
+-include("ddfs.hrl").
 -include("ddfs_tag.hrl").
 -include("config.hrl").
 
 -export([check_token/4, encode_tagcontent/1, encode_tagcontent_secure/1,
-         decode_tagcontent/1, update_tagcontent/4, delete_tagattrib/3,
+         decode_tagcontent/1, update_tagcontent/5, delete_tagattrib/3,
          validate_urls/1, validate_value/2]).
 
 -export([make_tagcontent/6]).
 
--spec check_token(tokentype(), token(), token(), token()) -> tokentype() | 'false'.
+-spec check_token(tokentype(), token(), token(), token()) -> tokentype() | false.
 check_token(TokenType, Token, ReadToken, WriteToken) ->
     Auth = fun(Tok, CurrentToken) when Tok =:= CurrentToken -> true;
               (internal, _) -> true;
@@ -71,7 +72,7 @@ encode_tagcontent_secure(D) ->
         ]})).
 
 lookup(Key, List) ->
-   {value, {_, Value}} = lists:keysearch(Key, 1, List),
+   {_, Value} = lists:keyfind(Key, 1, List),
    Value.
 lookup(Key, Default, List) ->
     proplists:get_value(Key, List, Default).
@@ -86,20 +87,15 @@ lookup_tagcontent(L) ->
                 write_token = lookup(<<"write-token">>, null, L),
                 user = UserData}.
 
--spec decode_tagcontent(binary()) ->
-                        {'error', 'corrupted_json' | 'invalid_object'} |
-                         {'ok', tagcontent()}.
+-spec decode_tagcontent(binary()) -> {error, corrupted_json | invalid_object} |
+                                     {ok, tagcontent()}.
 decode_tagcontent(TagData) ->
-    case catch mochijson2:decode(TagData) of
-        {'EXIT', _} ->
-            {error, corrupted_json};
-        {struct, Body} ->
-            case catch lookup_tagcontent(Body) of
-                {'EXIT', _} ->
-                    {error, invalid_object};
-                TagContent ->
-                    {ok, TagContent}
-            end
+    try case mochijson2:decode(TagData) of
+            {struct, Body} -> {ok, lookup_tagcontent(Body)};
+            _E -> {error, invalid_object}
+        end
+    catch _ ->   {error, corrupted_json};
+          _:_ -> {error, corrupted_json}
     end.
 
 -spec update_tagcontent(tagname(), tagcontent()) -> tagcontent().
@@ -107,23 +103,27 @@ update_tagcontent(TagName, Tag) ->
     Tag#tagcontent{id = ddfs_util:pack_objname(TagName, now()),
                    last_modified = ddfs_util:format_timestamp()}.
 
--spec update_tagcontent(tagname(), attrib(), _, _) ->
-                        {'error', 'too_many_attributes' | 'invalid_url_object'} |
-                        {'ok', tagcontent()}.
-update_tagcontent(TagName, Field, Value, {ok, Tag}) ->
+-spec update_tagcontent(tagname(), attrib(), _, _, token()) ->
+                               {error, too_many_attributes | invalid_url_object} |
+                               {ok, tagcontent()}.
+update_tagcontent(TagName, Field, Value, {ok, Tag}, _Token) ->
     Updated = update_tagcontent(TagName, Tag),
     update_tagcontent(Field, Value, Updated);
 
-update_tagcontent(TagName, Field, Value, _Tag) ->
-    New = #tagcontent{read_token = null,
-                      write_token = null,
+% make sure that 'internal' doesn't leak to the tag
+update_tagcontent(TagName, Field, Value, Tag, internal) ->
+    update_tagcontent(TagName, Field, Value, Tag, null);
+
+update_tagcontent(TagName, Field, Value, _Tag, Token) ->
+    New = #tagcontent{read_token = Token,
+                      write_token = Token,
                       urls = [],
                       user = []},
-    update_tagcontent(TagName, Field, Value, {ok, New}).
+    update_tagcontent(TagName, Field, Value, {ok, New}, Token).
 
 -spec update_tagcontent(attrib(), _, tagcontent()) ->
-                       {'error', 'too_many_attributes' | 'invalid_url_object'} |
-                       {'ok', tagcontent()}.
+                       {error, too_many_attributes | invalid_url_object} |
+                       {ok, tagcontent()}.
 update_tagcontent(read_token, Token, Tag) ->
     {ok, Tag#tagcontent{read_token = Token}};
 
@@ -162,11 +162,11 @@ delete_tagattrib(TagName, {user, Key}, Tag) ->
     User = lists:keydelete(Key, 1, Tag#tagcontent.user),
     update_tagcontent(TagName, Tag#tagcontent{user = User}).
 
--spec validate_urls([[_]]) -> bool().
+-spec validate_urls([[_]]) -> boolean().
 validate_urls(Urls) ->
     [] =:= (catch lists:flatten([[1 || X <- L, not is_binary(X)] || L <- Urls])).
 
--spec validate_value(attrib(), _) -> bool().
+-spec validate_value(attrib(), _) -> boolean().
 validate_value(urls, Value) ->
     validate_urls(Value);
 validate_value(read_token, Value) ->

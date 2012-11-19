@@ -19,7 +19,7 @@ from disco.error import CommError
 from disco.fileutils import Chunker, CHUNK_SIZE
 from disco.settings import DiscoSettings
 from disco.util import isiterable, iterify, listify, partition
-from disco.util import urljoin, urlsplit, urlresolve, urltoken
+from disco.util import urljoin, urlsplit, urlresolve, urltoken, proxy_url
 
 unsafe_re = re.compile(r'[^A-Za-z0-9_\-@:]')
 
@@ -222,6 +222,12 @@ class DDFS(object):
             if blobfilter(self.blob_name(repl[0])):
                 random.shuffle(repl)
                 for url in repl:
+                    url = self._resolve(
+                        proxy_url(url,
+                                  meth='GET',
+                                  proxy=self.proxy,
+                                  to_master=False)
+                    )
                     try:
                         yield open_remote(url)
                         break
@@ -360,12 +366,6 @@ class DDFS(object):
             dst.write(b)
         return s
 
-    def _maybe_proxy(self, url, method='GET'):
-        if self.proxy:
-            scheme, (host, port), path = urlsplit(url)
-            return '%s/proxy/%s/%s/%s' % (self.proxy, host, method, path)
-        return url
-
     def _push(self, (source, target), replicas=None, exclude=[], **kwargs):
         qs = urlencode([(k, v) for k, v in (('exclude', ','.join(exclude)),
                                             ('replicas', replicas)) if v])
@@ -375,7 +375,7 @@ class DDFS(object):
 
         try:
             return [json.loads(url)
-                    for url in self._upload(urls, source, **kwargs)]
+                    for url in self._upload(urls, source, to_master=False, **kwargs)]
         except CommError, e:
             scheme, (host, port), path = urlsplit(e.url)
             return self._push((source, target),
@@ -392,21 +392,27 @@ class DDFS(object):
             if token is None:
                 if method == 'GET':
                     token = self.settings['DDFS_READ_TOKEN']
-                    return token if token else None
+                    return token if isinstance(token, basestring) else None
                 token = self.settings['DDFS_WRITE_TOKEN']
-                return token if token else None
+                return token if isinstance(token, basestring) else None
         return token
 
     def _resolve(self, url):
         return urlresolve(url, master=self.master)
 
-    def _download(self, url, data=None, token=None, method='GET'):
-        return json.loads(download(self._resolve(url),
+    def _download(self, url, data=None, token=None, method='GET', to_master=True):
+        return json.loads(download(self._resolve(proxy_url(url,
+                                                           proxy=self.proxy,
+                                                           meth=method,
+                                                           to_master=to_master)),
                                    data=data,
                                    method=method,
                                    token=self._token(url, token, method)))
 
-    def _upload(self, urls, source, token=None, **kwargs):
-        urls = [self._resolve(self._maybe_proxy(url, method='PUT'))
+    def _upload(self, urls, source, token=None, to_master=True, **kwargs):
+        urls = [self._resolve(proxy_url(url,
+                                        proxy=self.proxy,
+                                        meth='PUT',
+                                        to_master=to_master))
                 for url in iterify(urls)]
         return upload(urls, source, token=self._token(url, token, 'PUT'), **kwargs)

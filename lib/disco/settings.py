@@ -138,17 +138,18 @@ Settings to control the proxying behavior:
 
         .. envvar:: DISCO_PROXY_ENABLED
 
-                If set, enable proxying through the master.
+                If set, enable proxying through the master.  This is a master-side setting (set in ``master:/etc/disco/settings.py``).
                 Default is ``''``.
 
         .. envvar:: DISCO_PROXY
 
-                The address of the proxy to use on the client side.
+                The address of the proxy to use on the client side.  This is in the format ``http://<proxy-host>:<proxy-port>``, where ``<proxy-port>`` normally matches the value of ``DISCO_PROXY_PORT`` set on the master.
+
                 Default is ``''``.
 
         .. envvar:: DISCO_PROXY_PORT
 
-                The port the master proxy should run on.
+                The port the master proxy should run on.  This is master-side setting (set in ``master:/etc/disco/settings.py``).
                 Default is ``8999``.
 
 Settings to control the scheduler behavior:
@@ -221,6 +222,11 @@ Settings used by DDFS:
 
                 The default write authorization token to use.
                 Default is ``None``.
+
+        .. envvar:: DDFS_GC_INITIAL_WAIT
+
+                The amount of time to wait after startup before running GC (in minutes).
+                Default is ``''``, which triggers an internal default of 5 minutes.
 
         .. envvar:: DDFS_PARANOID_DELETE
 
@@ -307,7 +313,8 @@ class DiscoSettings(Settings):
         'DDFS_TAG_MIN_REPLICAS': "1",
         'DDFS_TAG_REPLICAS':     "1",
         'DDFS_BLOB_REPLICAS':    "1",
-        'DDFS_PARANOID_DELETE':  "''"
+        'DDFS_PARANOID_DELETE':  "''",
+        'DDFS_GC_INITIAL_WAIT':  "''"
         }
 
     globals = globals()

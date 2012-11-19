@@ -21,10 +21,13 @@ Some of the :program:`ddfs` utilities also work with data stored in Disco's temp
    If ``/usr/local/bin`` is not in your ``$PATH``, use an appropriate replacement.
    Doing so allows you to simply call :command:`ddfs`, instead of specifying the complete path.
 
-
 Run :command:`ddfs help` for information on using the command line utility.
 
-See also: :mod:`disco.settings`
+.. seealso::
+
+        The :mod:`disco <discocli>` command.
+
+        See :mod:`disco.settings` for information about Disco settings.
 """
 
 import fileinput, os, sys
@@ -69,7 +72,7 @@ def cat(program, *urls):
     from itertools import chain
     from subprocess import call
     from disco.comm import download
-    from disco.util import deref
+    from disco.util import deref, urlresolve, proxy_url
 
     ignore_missing = program.options.ignore_missing
     tags, urls     = program.separate_tags(*urls)
@@ -77,7 +80,8 @@ def cat(program, *urls):
     def curl(replicas):
         for replica in replicas:
             try:
-                return download(replica)
+                return download(proxy_url(urlresolve(replica, master=program.ddfs.master),
+                                          to_master=False))
             except Exception, e:
                 sys.stderr.write("%s\n" % e)
         if not ignore_missing:
@@ -116,7 +120,7 @@ def chunk(program, tag, *urls):
     from itertools import chain
     from disco.util import reify
 
-    tags, urls = program.separate_tags(*urls)
+    tags, urls = program.separate_tags(*program.input(*urls))
     stream = reify(program.options.stream)
     reader = reify(program.options.reader or 'None')
     tag, blobs = program.ddfs.chunk(tag,
@@ -384,11 +388,10 @@ def xcat(program, *urls):
     from disco.core import classic_iterator
     from disco.util import iterify, reify
 
-    tags, urls = program.separate_tags(*urls)
+    tags, urls = program.separate_tags(*program.input(*urls))
     stream = reify(program.options.stream)
     reader = program.options.reader
     reader = reify('disco.func.chain_reader' if reader is None else reader)
-
     for record in classic_iterator(chain(urls, program.blobs(*tags)),
                                    input_stream=stream,
                                    reader=reader):

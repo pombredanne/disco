@@ -12,7 +12,10 @@ A :term:`worker` is an executable that can run a task, given by the
 Disco :term:`master`.  The executable could either be a binary
 executable, or a script that launches other executables.  In order to
 be usable as a Disco worker, an executable needs to implement the
-:ref:`worker_protocol`.
+:ref:`worker_protocol`. For instance, `ODisco
+<https://github.com/pmundkur/odisco>`_, which implements the Disco
+Worker Protocol, allows you to write Disco jobs in
+`the O'Caml language <http://caml.inria.fr/ocaml/index.en.html>`_.
 
 There are two parts to using a binary executable as a Disco worker.
 The first part is the submission of the executable to the Disco master.
@@ -54,11 +57,11 @@ Message Format
 
 Messages in the protocol, both from and to the worker, are in the format:
 
-         *<name>* 'SP' *<payload-len>* 'SP' *<payload>* '\n'
+         *<name>* 'SP' *<payload-len>* 'SP' *<payload>* '\\n'
 
 where 'SP' denotes a single space character, and *<name>* is one of:
 
-      |     :ref:`END`
+      |     :ref:`DONE`
       |     :ref:`ERROR`
       |     :ref:`FAIL`
       |     :ref:`FATAL`
@@ -67,45 +70,45 @@ where 'SP' denotes a single space character, and *<name>* is one of:
       |     :ref:`MSG`
       |     :ref:`OK`
       |     :ref:`OUTPUT`
-      |     :ref:`PID`
+      |     :ref:`PING`
       |     :ref:`RETRY`
       |     :ref:`TASK`
-      |     :ref:`VSN`
+      |     :ref:`WAIT`
+      |     :ref:`WORKER`
 
 *<payload-len>* is the length of the *<payload>* in bytes,
 and *<payload>* is a :term:`JSON` formatted term.
 
+Note that messages that have no payload (see below) actually
+contain an empty JSON string *<payload> = ""* and *<payload-len> = 2*.
+
 Messages from the Worker to Disco
 =================================
 
-.. _VSN:
+.. _WORKER:
 
-VSN
----
+WORKER
+------
 
-   Announce the version of the message protocol the worker is using.
+   Announce the startup of the worker.
 
-   The worker should send a `VSN` message before it sends any others.
-   The string payload of the `VSN` message should be the protocol
-   version the worker is using.  The current version is `"1.0"`.
-   Disco should respond with an `OK` if it intends to use the same
-   version.
+   The payload is a dictionary containing the following information:
 
-.. _PID:
+   "version"
+        The version of the message protocol the worker is using, as a
+        string.  The current version is `"1.0"`.
 
-PID
----
+   "pid"
+        The integer :term:`pid` of the worker.
 
-   Announce the :term:`pid` of the worker to Disco.
+        The worker should send this so it can be properly killed,
+        (e.g. if there's a problem with the :term:`job`).  This is
+        currently required due to limitations in the Erlang support
+        for external spawned processes.
 
-   The worker should send a `PID` message, with a payload containing
-   its :term:`pid` as an integer.  Disco should respond with an `OK`.
-
-   .. note::
-      The worker should send this so it can be properly killed,
-      (e.g. if there's a problem with the :term:`job`).  This is
-      currently required due to limitations in the Erlang support for
-      external spawned processes.
+   The worker should send a `WORKER` message before it sends any
+   others.  Disco should respond with an `OK` if it intends to use the
+   same version.
 
 .. _TASK:
 
@@ -193,12 +196,24 @@ INPUT
    each such location is called a `replica`.  A `rep_id` is an integer
    identifying the replica.
 
-   The `replica_location` is specified as a URL.  The protocol scheme
-   used for the `replica_location` could be one of `http`, `disco`, or
-   `raw`.  A URL with the `disco` scheme is to be accessed using HTTP
-   at the `disco_port` specified in the `TASK` response from Disco.
+   The `replica_location` is specified as a URL. The protocol scheme
+   used for the `replica_location` could be one of `http`, `disco`,
+   `dir` or `raw`. A URL with the `disco` scheme is to be accessed using
+   HTTP at the `disco_port` specified in the `TASK` response from Disco.
    The `raw` scheme denotes that the URL itself (minus the scheme) is
-   the data for the task.
+   the data for the task. The data needs to be properly URL encoded,
+   for instance using Base64 encoding. The `dir` is like the `disco`
+   scheme, except that the file pointed to contains lines of the form
+
+   *<label>* 'SP' *<url>* '\\n'
+
+   The `'label'` comes from the `'label'` specified in an `OUTPUT`
+   message by a task, while the `'url'` points to a file containing
+   output data generated with that label.  This is currently how
+   labeled output data is communicated by upstream tasks to downstream
+   ones, e.g. from map tasks to reduce tasks, or from tasks in the
+   final phase of a previous job to the tasks in the first phase of a
+   subsequent job (see :ref:`dataflow`).
 
    One important optimization is to use the local filesystem instead
    of HTTP for accessing inputs when they are local.  This can be
@@ -303,10 +318,10 @@ OUTPUT
    Labels are currently only interpreted for `'part'` outputs, and are
    integers that are used to denote the partition for the output.
 
-.. _END:
+.. _DONE:
 
-END
----
+DONE
+----
 
    Inform Disco that the worker is finished.
 
@@ -328,7 +343,7 @@ ERROR
    The worker can send a `ERROR` message with a payload containing the
    error message as a string.  This message will terminate the worker,
    but not the job.  The current task will be retried by Disco.  See
-   also the information above for the `END` message.
+   also the information above for the `DONE` message.
 
 .. _FATAL:
 
@@ -339,7 +354,18 @@ FATAL
 
    The worker can send an `FATAL` message, with a payload containig
    the error message as a string.  This message will terminate the
-   entire job.  See also the information above for the `END` message.
+   entire job.  See also the information above for the `DONE` message.
+
+.. _PING:
+
+PING
+----
+
+   No-op - always returns `OK`.
+
+   Worker can use `PING` as a heartbeat message, to make sure that the
+   master is still alive and responsive.
+
 
 Messages from Disco to the Worker
 =================================
@@ -349,7 +375,7 @@ Messages from Disco to the Worker
 OK
 --
 
-   A generic response from Disco.  This message has no payload.
+   A generic response from Disco.  This message has the payload `"ok"`.
 
 .. _FAIL:
 
@@ -365,13 +391,20 @@ RETRY
 
    A possible response from Disco for an `INPUT_ERR` message, as described above.
 
+.. _WAIT:
+
+WAIT
+-----
+
+   A possible response from Disco for an `INPUT_ERR` message, as described above.
+
 .. _protocol_session:
 
 Sessions of the Protocol
 ========================
 
-On startup, the worker should first send the `VSN` and `PID` messages,
-and then request the `TASK` information.  The `taskid` and `mode` in
+On startup, the worker should first send the `WORKER` message, and
+then request the `TASK` information.  The `taskid` and `mode` in
 the `TASK` response can be used, along with the current system time,
 to create a working directory within which to store any scratch data
 that will not interact with other, possibly concurrent, workers
@@ -382,7 +415,7 @@ The crucial messages the worker will then send are the `INPUT` and
 `OUTPUT` messages, and often the `INPUT_ERR` messages.  The processing
 of the responses to `INPUT` and `INPUT_ERR` will be determined by the
 application.  The worker will usually end a successful session with
-one or more `OUTPUT` messages followed by the `END` message.  Note
+one or more `OUTPUT` messages followed by the `DONE` message.  Note
 that it is possible for a successful session to have several
 `INPUT_ERR` messages, due to transient network conditions in the
 cluster as well as machines going down and recovering.
