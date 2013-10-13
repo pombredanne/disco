@@ -3,6 +3,7 @@
 
 -include("common_types.hrl").
 -include("disco.hrl").
+-include("pipeline.hrl").
 -include("config.hrl").
 
 -spec op(atom(), string(), module()) -> _.
@@ -41,7 +42,7 @@ op('GET', "/disco/ctrl/" ++ Op, Req) ->
     Name =
         case lists:keyfind("name", 1, Query) of
             {_, N} -> N;
-            _ -> false
+            _      -> false
         end,
     reply(getop(Op, {Query, Name}), Req);
 
@@ -76,13 +77,10 @@ getop("joblist", _Query) ->
 
 getop("jobinfo", {_Query, JobName}) ->
     {ok, Active} = disco_server:get_active(JobName),
+    HostInfo = lists:unzip([{H, S} || {H, _J, S} <- Active]),
     case event_server:get_jobinfo(JobName) of
-        {ok, JobInfo} ->
-            HostInfo = lists:unzip([{Host, M}
-                                    || {Host, #task{mode = M}} <- Active]),
-            {ok, render_jobinfo(JobInfo, HostInfo)};
-        invalid_job ->
-            not_found
+        {ok, JobInfo} -> {ok, render_jobinfo(JobInfo, HostInfo)};
+        invalid_job   -> not_found
     end;
 
 getop("parameters", {_Query, Name}) ->
@@ -92,10 +90,12 @@ getop("rawevents", {_Query, Name}) ->
     job_file(Name, "events");
 
 getop("jobevents", {Query, Name}) ->
-    {_, NumS} = lists:keyfind("num", 1, Query),
-    Num = list_to_integer(NumS),
+    Num = case lists:keyfind("num", 1, Query) of
+              false  -> 10;
+              {_, N} -> list_to_integer(N)
+          end,
     Q = case lists:keyfind("filter", 1, Query) of
-            false -> "";
+            false  -> "";
             {_, F} -> string:to_lower(F)
         end,
     {ok, Ev} = event_server:get_job_msgs(Name, string:to_lower(Q), Num),
@@ -105,7 +105,7 @@ getop("nodeinfo", _Query) ->
     {ok, Active} = disco_server:get_active(all),
     {ok, DiscoNodes} = disco_server:get_nodeinfo(all),
     {ok, DDFSNodes} = ddfs_master:get_nodeinfo(all),
-    ActiveNodeInfo = lists:foldl(fun ({Host, #task{jobname = JobName}}, Dict) ->
+    ActiveNodeInfo = lists:foldl(fun ({Host, JobName, _Stage}, Dict) ->
                                          dict:append(Host,
                                                      list_to_binary(JobName),
                                                      Dict)
@@ -147,16 +147,14 @@ getop("get_settings", _Query) ->
                                  fun(S) ->
                                      case application:get_env(disco, S) of
                                          {ok, V} -> {S, V};
-                                         _ -> false
+                                         _       -> false
                                      end
                                  end, L))}};
 
 getop("get_mapresults", {_Query, Name}) ->
     case event_server:get_map_results(Name) of
-        {ok, _Res} = OK ->
-            OK;
-        _ ->
-            not_found
+        {ok, _Res} = OK -> OK;
+        _               -> not_found
     end;
 
 getop(_, _) -> not_found.
@@ -165,7 +163,8 @@ getop(_, _) -> not_found.
                        term(), fun((term()) -> T)) -> T.
 validate_payload(_Op, Spec, Payload, Fun) ->
     case json_validator:validate(Spec, Payload) of
-        ok -> Fun(Payload);
+        ok ->
+            Fun(Payload);
         {error, E} ->
             Msg = list_to_binary(json_validator:error_msg(E)),
             {error, Msg}
@@ -266,59 +265,57 @@ update_setting(<<"max_failure_rate">>, Val, App) ->
 update_setting(Key, Val, _) ->
     lager:info("Unknown setting: ~p = ~p", [Key, Val]).
 
-count_maps(L) ->
-    {M, N} = lists:foldl(fun (map, {M, N}) ->
-                                 {M + 1, N + 1};
-                             (reduce, {M, N}) ->
-                                 {M, N + 1}
-                         end, {0, 0}, L),
-    {M, N - M}.
+dfind(Key, Dict, Default) ->
+    case dict:find(Key, Dict) of
+        {ok, Value} -> Value;
+        error       -> Default
+    end.
 
--spec render_jobinfo(event_server:job_eventinfo(), {[host()], [task_mode()]})
+-spec render_jobinfo(event_server:job_eventinfo(), {[host()], [stage_name()]})
                     -> term().
-render_jobinfo({Start, Status0, JobInfo, Results, Ready, Failed},
-               {Hosts, Modes}) ->
-    {NMapRun, NRedRun} = count_maps(Modes),
-    NMapDone = dict:fetch(map, Ready),
-    NRedDone = dict:fetch(reduce, Ready),
-    NMapFail = dict:fetch(map, Failed),
-    NRedFail = dict:fetch(reduce, Failed),
-    {Status, MapI, RedI, Reduce, Inputs, Worker, Owner} =
+render_jobinfo({Start, Status0, JobInfo, Results, Count, Ready, Fail},
+               {Hosts, Stages}) ->
+    Run = lists:foldl(fun(S, D) -> dict:update_counter(S, 1, D) end,
+                      dict:new(),
+                      Stages),
+    {Status, Pipeline, JobInputs, Worker, Owner} =
         case JobInfo of
             none ->
                 % The job is still initializing; use some defaults.
-                {<<"initializing">>, 0, 0, true, [], <<"">>, <<"">>};
-            #jobinfo{map = M, reduce = R, inputs = I, nr_reduce = NR,
-                     worker = W, owner = O} ->
+                {<<"initializing">>, [], [], <<"">>, <<"">>};
+            #jobinfo{pipeline = P, worker = W, owner = O, inputs = I} ->
+                % Show each input individually in the UI, regardless
+                % of grouping.  The UI should be fixed to give a
+                % better idea of what the input grouping is, and how
+                % the inputs are grouped accordingly.
+                Inputs = lists:flatten([pipeline_utils:input_urls(Input, split, {0, " "})
+                                        || {_Id, Input} <- I]),
                 {list_to_binary(atom_to_list(Status0)),
-                 if M -> length(I) - (NMapDone + NMapRun);
-                    true -> 0
-                 end,
-                 if R -> NR - (NRedDone + NRedRun);
-                    true -> 0
-                 end,
-                 R, lists:sublist(I, 100), W, O}
+                 [[S, dfind(S, Count, 0) - (R + D), R, D, dfind(S, Fail, 0)]
+                  || {S, _} <- P,
+                     R <- [dfind(S, Run, 0)], D <- [dfind(S, Ready, 0)]],
+                 lists:flatten([Urls || {_L, Urls} <- Inputs]),
+                 W, O}
         end,
     {struct, [{timestamp, disco_util:format_timestamp(Start)},
               {active, Status},
-              {mapi, [MapI, NMapRun, NMapDone, NMapFail]},
-              {redi, [RedI, NRedRun, NRedDone, NRedFail]},
-              {reduce, Reduce},
+              {pipeline, Pipeline},
               {results, lists:flatten(Results)},
-              {inputs, Inputs},
+              {inputs, JobInputs},
               {worker, Worker},
               {hosts, [list_to_binary(Host) || Host <- Hosts]},
               {owner, Owner}
              ]}.
 
-status_msg(invalid_job) -> [<<"unknown job">>, []];
+status_msg(invalid_job)         -> [<<"unknown job">>, []];
 status_msg({ready, _, Results}) -> [<<"ready">>, Results];
-status_msg({active, _}) -> [<<"active">>, []];
-status_msg({dead, _}) -> [<<"dead">>, []].
+status_msg({active, _})         -> [<<"active">>, []];
+status_msg({dead, _})           -> [<<"dead">>, []].
 
 wait_jobs(Jobs, Timeout) ->
     case [erlang:monitor(process, Pid) || {_, {active, Pid}} <- Jobs] of
-        [] -> Jobs;
+        [] ->
+            Jobs;
         _ ->
             receive {'DOWN', _, _, _, _} -> ok
             after Timeout -> ok

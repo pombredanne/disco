@@ -26,6 +26,8 @@ from disco.error import JobError
 from disco.util import hexhash, isiterable, load_oob, save_oob
 from disco.settings import DiscoSettings
 from disco.compat import bytes_to_str
+from disco import JOBPACK_VERSION1
+
 
 class Job(object):
     """
@@ -125,20 +127,22 @@ class Job(object):
         in :meth:`disco.worker.Worker.jobdict`.  The default worker
         implementation is called ``classic``, and is implemented by
         :class:`disco.worker.classic.worker`.
+
         :type  jobargs: dict
-        :param jobargs: runtime parameters for the job.
-                        Passed to the :class:`disco.worker.Worker`
-                        methods listed above, along with the job
-                        itself.  The interpretation of the jobargs is
-                        performed by the worker interface
-                        in :class:`disco.worker.Worker` and the class
-                        implementing that interface (which defaults
+        :param jobargs: runtime parameters for the job.               \
+                        Passed to the :class:`disco.worker.Worker`    \
+                        methods listed above, along with the job      \
+                        itself.  The interpretation of the jobargs is \
+                        performed by the worker interface             \
+                        in :class:`disco.worker.Worker` and the class \
+                        implementing that interface (which defaults   \
                         to :class:`disco.worker.classic.worker`).
 
         :raises: :class:`disco.error.JobError` if the submission fails.
         :return: the :class:`Job`, with a unique name assigned by the master.
         """
-        jobpack = JobPack(self.worker.jobdict(self, **jobargs),
+        jobpack = JobPack(self.worker.jobpack_version,
+                          self.worker.jobdict(self, **jobargs),
                           self.worker.jobenvs(self, **jobargs),
                           self.worker.jobhome(self, **jobargs),
                           task.jobdata(self, jobargs))
@@ -218,19 +222,22 @@ class JobPack(object):
 
                    See also :ref:`jobdata`.
     """
-    MAGIC = (0xd5c0 << 16) + 0x0001
+    MAGIC = (0xd5c0 << 16)
+    MAGIC_MASK = (0xffff << 16)
+    VERSION = JOBPACK_VERSION1
     HEADER_FORMAT = "!IIIII"
     HEADER_SIZE = 128
-    def __init__(self, jobdict, jobenvs, jobhome, jobdata):
+    def __init__(self, version, jobdict, jobenvs, jobhome, jobdata):
+        self.version = version
         self.jobdict = jobdict
         self.jobenvs = jobenvs
         self.jobhome = jobhome
         self.jobdata = jobdata
 
     @classmethod
-    def header(self, offsets, magic=MAGIC, format=HEADER_FORMAT, size=HEADER_SIZE):
+    def header(self, offsets, magic=MAGIC, version=VERSION, format=HEADER_FORMAT, size=HEADER_SIZE):
         from struct import pack
-        toc = pack(format, magic, *(o for o in offsets))
+        toc = pack(format, magic + version, *(o for o in offsets))
         return toc + b'\0' * (size - len(toc))
 
     def contents(self, offset=HEADER_SIZE):
@@ -251,14 +258,14 @@ class JobPack(object):
         and prepends a valid header.
         """
         offsets, fields = zip(*self.contents())
-        return self.header(offsets) + b''.join(fields)
+        return self.header(offsets, version=self.version) + b''.join(fields)
 
     @classmethod
     def offsets(cls, jobfile, magic=MAGIC, format=HEADER_FORMAT, size=HEADER_SIZE):
         from struct import calcsize, unpack
         jobfile.seek(0)
         header = [i for i in unpack(format, jobfile.read(calcsize(format)))]
-        assert header[0] == magic, "Invalid jobpack magic."
+        assert (header[0] & cls.MAGIC_MASK) == magic, "Invalid jobpack magic."
         assert header[1] == size, "Invalid jobpack header."
         assert header[1:] == sorted(header[1:]), "Invalid jobpack offsets."
         return header[1:]

@@ -1,7 +1,7 @@
 export
 
-DISCO_VERSION = 0.4.4
-DISCO_RELEASE = 0.4.4
+DISCO_VERSION = 0.4.5
+DISCO_RELEASE = 0.4.5
 
 # standard make installation variables
 sysconfdir    = /etc
@@ -78,6 +78,10 @@ master: dep
 clean:
 	@ (cd master && ./rebar clean)
 	- rm -Rf lib/build lib/disco.egg-info
+	- find lib -name __pycache__ | xargs rm -rf
+
+xref: master
+	@ (cd master && ./rebar xref)
 
 test:
 	@ (cd master && ./rebar -C eunit.config get-deps eunit)
@@ -139,7 +143,7 @@ uninstall-node:
 install-tests: $(TARGETLIB)/ext $(TARGETLIB)/tests
 
 dialyzer: $(EPLT) master
-	$(DIALYZER) --get_warnings -Wunmatched_returns -Werror_handling --plt $(EPLT) -r $(EBIN)
+	$(DIALYZER) --get_warnings -Wno_return -Wunmatched_returns -Werror_handling --plt $(EPLT) -r $(EBIN)
 
 dialyzer-clean:
 	- rm -Rf $(EPLT)

@@ -1,14 +1,14 @@
 % Utility types.
 
 -type next_job() :: {ok, pid()} | nojobs.
--type nodestat() :: {false | non_neg_integer(), task_input()}.
+-type loadstats() :: gb_tree(). % host() -> non_neg_integer() (# running tasks)
 -type priority() :: float().
--type node_update() :: {host(), cores()}.
+-type node_info() :: {host(), cores(), non_neg_integer()}.
 
 % Common scheduler msgs.
 
--type new_task_msg()     :: {new_task, task(), [nodestat()]}.
--type update_nodes_msg() :: {update_nodes, [node_update()]}.
+-type new_task_msg()     :: {new_task, task(), loadstats()}.
+-type update_nodes_msg() :: {update_nodes, [node_info()]}.
 
 -type new_job_msg()  :: {new_job, pid(), jobname()}.
 -type next_job_msg() :: {next_job, [pid()]}.

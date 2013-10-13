@@ -5,5 +5,10 @@
 # follow all Debian packaging guidelines, so do not use the settings
 # in this script if backwards-compatibility is not an issue for you.
 
+export LANG=C # Silence warnings from debian scripts.
 make clean debian-clean
+
+# Use 'make debian' below to generate more Debian compliant packages.
+# The prefix and RELSRV settings ensure backwards-compatibility with
+# Disco debian packages available from discoproject.org.
 make debian prefix=/usr RELSRV=/srv/disco
