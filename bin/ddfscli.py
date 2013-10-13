@@ -73,6 +73,7 @@ def cat(program, *urls):
     from subprocess import call
     from disco.comm import download
     from disco.util import deref, urlresolve, proxy_url
+    from disco.compat import bytes_to_str
 
     ignore_missing = program.options.ignore_missing
     tags, urls     = program.separate_tags(*urls)
@@ -89,7 +90,7 @@ def cat(program, *urls):
         return ''
 
     for replicas in deref(chain(urls, program.blobs(*tags))):
-        sys.stdout.write(curl(replicas))
+        sys.stdout.write(bytes_to_str(curl(replicas)))
 
 @DDFS.command
 def chtok(program, tag, token):
@@ -391,7 +392,7 @@ def xcat(program, *urls):
     tags, urls = program.separate_tags(*program.input(*urls))
     stream = reify(program.options.stream)
     reader = program.options.reader
-    reader = reify('disco.func.chain_reader' if reader is None else reader)
+    reader = reify('disco.worker.task_io.chain_reader' if reader is None else reader)
     for record in classic_iterator(chain(urls, program.blobs(*tags)),
                                    input_stream=stream,
                                    reader=reader):

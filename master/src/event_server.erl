@@ -1,14 +1,17 @@
 -module(event_server).
 -behaviour(gen_server).
 
+% Cluster state.
+-export([update_nodes/1]).
 % Job notification.
--export([new_job/2, end_job/1, clean_job/1]).
+-export([new_job/3, end_job/1, clean_job/1]).
 % Retrieval.
 -export([get_jobs/0, get_jobs/1, get_jobinfo/1, get_job_msgs/3,
          get_map_results/1, get_results/1]).
 % Event logging.
 -export([event/4, event/5, event/6,
-         task_event/2, task_event/3, task_event/4, task_event/5]).
+         task_event/2, task_event/3, task_event/4, task_event/5,
+         job_done_event/2]).
 % Server.
 -export([start_link/0, init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
@@ -16,17 +19,20 @@
 -include("common_types.hrl").
 -include("gs_util.hrl").
 -include("disco.hrl").
+-include("pipeline.hrl").
 
 -define(EVENT_PAGE_SIZE, 100).
 -define(EVENT_BUFFER_SIZE, 1000).
 -define(EVENT_BUFFER_TIMEOUT, 2000).
 
 -type event() :: {job_data, jobinfo()}
-               | {task_ready, task_mode()}
-               | {task_failed, task_mode()}
-               | {map_ready, [job_coordinator:input()]}
-               | {reduce_ready, [job_coordinator:input()]}
-               | {ready, [job_coordinator:input()]}.
+               | {task_ready, stage_name()}
+               | {task_failed, stage_name()}
+               | {stage_start, stage_name(), integer()}
+               | {stage_ready, stage_name(), [[url()]]}
+               | {ready, [url() | [url()]]}.
+
+-type task_info() :: {jobname(), stage_name(), task_id()}.
 
 -type task_msg() :: {binary(), term()} | string().
 
@@ -39,17 +45,24 @@
 -type job_eventinfo() :: {StartTime :: erlang:timestamp(),
                           Status  :: job_status(),
                           JobInfo :: none | jobinfo(),
-                          Results :: [job_coordinator:input()],
+                          Results :: [[url()]],
+                          Count   :: dict(),
                           Ready   :: dict(),
                           Failed  :: dict()}.
 
--export_type([event/0, task_msg/0, job_eventinfo/0]).
+-export_type([event/0, task_info/0, task_msg/0, job_eventinfo/0]).
+
+% Cluster configuration.
+
+-spec update_nodes([host()]) -> ok.
+update_nodes(Hosts) ->
+    gen_server:cast(?MODULE, {update_nodes, Hosts}).
 
 % Job notification.
 
--spec new_job(jobname(), pid()) -> {ok, jobname()}.
-new_job(Prefix, JobCoordinator) ->
-    gen_server:call(?MODULE, {new_job, Prefix, JobCoordinator}, 10000).
+-spec new_job(jobname(), pid(), [stage_name()]) -> {ok, jobname(), [host()]}.
+new_job(Prefix, JobCoord, Stages) ->
+    gen_server:call(?MODULE, {new_job, Prefix, JobCoord, Stages}, 10000).
 
 -spec end_job(jobname()) -> ok.
 end_job(JobName) ->
@@ -78,11 +91,11 @@ get_job_msgs(JobName, Q, N) ->
     gen_server:call(?MODULE, {get_job_msgs, JobName, string:to_lower(Q), N}).
 
 -spec get_map_results(jobname()) -> invalid_job | not_ready
-                                        | {ok, [job_coordinator:input()]}.
+                                        | {ok, [[url()]]}.
 get_map_results(JobName) ->
     gen_server:call(?MODULE, {get_map_results, JobName}).
 
--spec get_results(jobname()) -> invalid_job | {ready, pid(), [job_coordinator:input()]}
+-spec get_results(jobname()) -> invalid_job | {ready, pid(), [url() | [url()]]}
                                     | {job_status(), pid()}.
 get_results(JobName) ->
     gen_server:call(?MODULE, {get_results, JobName}).
@@ -110,28 +123,36 @@ event(EventServer, Host, JobName, MsgFormat, Args, Event) ->
     Msg = list_to_binary(Json),
     gen_server:cast(EventServer, {add_job_event, Host, JobName, Msg, Event}).
 
--spec task_event(task(), task_msg()) -> ok.
+-spec job_done_event(jobname(), [url()|[url()]]) -> ok.
+job_done_event(JobName, Results) ->
+    gen_server:cast(?MODULE, {job_done_event, JobName, Results}).
+
+-spec task_event(task_info(), task_msg()) -> ok.
 task_event(Task, Msg) ->
     task_event(Task, Msg, none).
 
--spec task_event(task(), task_msg(), none | event()) -> ok.
+-spec task_event(task_info(), task_msg(), none | event()) -> ok.
 task_event(Task, Msg, Event) ->
     task_event(Task, Msg, Event, "master").
 
--spec task_event(task(), task_msg(), none | event(), host()) -> ok.
+-spec task_event(task_info(), task_msg(), none | event(), host()) -> ok.
 task_event(Task, Msg, Event, Host) ->
     task_event(Task, Msg, Event, Host, ?MODULE).
 
--spec task_event(task(), task_msg(), none | event(), host(), server()) -> ok.
-task_event(Task, {Type, Message}, Event, Host, EventServer) ->
-    event(EventServer,
-          Host,
-          Task#task.jobname,
-          "~s: [~s:~B] " ++ task_format(Message),
-          [Type, Task#task.mode, Task#task.taskid, Message],
+-spec task_event(task_info(), task_msg(), none | event(), host(), server()) -> ok.
+task_event({JN, Stage, TaskId}, {Type, Message}, Event, Host, EventServer) ->
+    event(EventServer, Host, JN,
+          "~s: [~s:~B] " ++ msg_format(Message),
+          [Type, Stage, TaskId, Message],
           Event);
 task_event(Task, Message, Event, Host, EventServer) ->
     task_event(Task, {<<"SYS">>, Message}, Event, Host, EventServer).
+
+-spec msg_format(term()) -> nonempty_string().
+msg_format(Msg) when is_atom(Msg) or is_binary(Msg) or is_list(Msg) ->
+    "~s";
+msg_format(_Msg) ->
+    "~w".
 
 % Server.
 
@@ -143,56 +164,63 @@ start_link() ->
         {error, {already_started, Server}} -> {ok, Server}
     end.
 
-% state :: {events dict, msgbuf dict}.
-% events dict: jobname -> { [event()], <start_time>, <job_coordinator_pid> }
+% events dict: jobname -> job_ent()
 % msgbuf dict: jobname -> { <nmsgs>, <list-length>, [<msg>] }
--type state() :: {dict(), dict()}.
+-record(state, {events = dict:new() :: dict(),
+                msgbuf = dict:new() :: dict(),
+                hosts  = []         :: [host()]}).
+-type state() :: #state{}.
 
 -spec init(_) -> gs_init().
 init(_Args) ->
     _ = ets:new(event_files, [named_table]),
-    {ok, {dict:new(), dict:new()}}.
+    {ok, #state{}}.
 
 -spec handle_call(term(), from(), state()) -> gs_reply(term()) | gs_noreply().
 
-handle_call({new_job, JobPrefix, Pid}, From, {Events0, MsgBuf0} = S) ->
+handle_call({new_job, JobPrefix, Pid, Stages}, From,
+            #state{events = Events0, msgbuf = MsgBuf0, hosts = Hosts} = S) ->
     case unique_key(JobPrefix, Events0) of
         invalid_prefix ->
             {reply, {error, invalid_prefix}, S};
         {ok, JobName} ->
-            Events = dict:store(JobName, new_job_ent(Pid), Events0),
+            Events = dict:store(JobName, new_job_ent(Pid, Stages), Events0),
             MsgBuf = dict:store(JobName, {0, 0, []}, MsgBuf0),
-            spawn(fun() -> job_event_handler(JobName, From) end),
-            {noreply, {Events, MsgBuf}}
+            spawn(fun() -> job_event_handler(JobName, Hosts, From) end),
+            {noreply, S#state{events = Events, msgbuf = MsgBuf}}
     end;
-handle_call(get_jobs, _From, {Events, _MsgBuf} = S) ->
+handle_call(get_jobs, _F, #state{events = Events} = S) ->
     {reply, do_get_jobs(Events), S};
-handle_call({get_job_msgs, JobName, Query, N}, _From, {_Events, MsgBuf} = S) ->
-    {reply, do_get_job_msgs(JobName, Query, N, MsgBuf), S};
-handle_call({get_results, JobName}, _From, {Events, _MsgBuf} = S) ->
+handle_call({get_job_msgs, JobName, Query, N}, _F, #state{msgbuf = MB} = S) ->
+    {reply, do_get_job_msgs(JobName, Query, N, MB), S};
+handle_call({get_results, JobName}, _F, #state{events = Events} = S) ->
     {reply, do_get_results(JobName, Events), S};
-handle_call({get_map_results, JobName}, _From, {Events, _MsgBuf} = S) ->
+handle_call({get_map_results, JobName}, _F, #state{events = Events} = S) ->
     {reply, do_get_map_results(JobName, Events), S};
-handle_call({job_initialized, JobName, JobEventHandler}, _From, S) ->
+handle_call({job_initialized, JobName, JobEventHandler}, _F, S) ->
     ets:insert(event_files, {JobName, JobEventHandler}),
     S1 = add_event("master", JobName, <<"\"New job initialized!\"">>, none, S),
     {reply, ok, S1};
-handle_call({get_jobinfo, JobName}, _From, {Events, _MsgBuf} = S) ->
+handle_call({get_jobinfo, JobName}, _F, #state{events = Events} = S) ->
     {reply, do_get_jobinfo(JobName, Events), S}.
 
 -spec handle_cast(term(), state()) -> gs_noreply().
 
+handle_cast({update_nodes, Hosts}, S) ->
+    {noreply, S#state{hosts = Hosts}};
 handle_cast({add_job_event, Host, JobName, Msg, Event}, S) ->
     {noreply, do_add_job_event(Host, JobName, Msg, Event, S)};
+handle_cast({job_done_event, JobName, Results}, S) ->
+    {noreply, do_job_done_event(JobName, Results, S)};
 % XXX: Some aux process could go through the jobs periodically and
 % check that the job coord is still alive - if not, call job_done for
 % the zombie job.
 handle_cast({job_done, JobName}, S) ->
     {noreply, do_job_done(JobName, S)};
-handle_cast({clean_job, JobName}, {Events, _MsgBuf} = S) ->
-    {_, {_, MsgBufN}} = handle_cast({job_done, JobName}, S),
+handle_cast({clean_job, JobName}, S) ->
+    #state{events = Events} = S1 = do_job_done(JobName, S),
     delete_jobdir(JobName),
-    {noreply, {dict:erase(JobName, Events), MsgBufN}}.
+    {noreply, S1#state{events = dict:erase(JobName, Events)}}.
 
 -spec handle_info(term(), state()) -> gs_noreply().
 handle_info(Msg, State) ->
@@ -210,44 +238,42 @@ code_change(_OldVsn, State, _Extra) -> {ok, State}.
 -record(job_ent, {job_coord :: pid(),
                   start     :: erlang:timestamp(),
                   job_data    = none :: none | jobinfo(),
-                  task_ready    :: dict(), % task_mode() -> count
-                  task_failed   :: dict(), % task_mode() -> count
-                  phase_results :: dict(), % task_mode() -> results
-                  job_results = none :: none | [job_coordinator:input()]}).
+                  task_count         :: dict(), % stage_name() -> count
+                  task_ready         :: dict(), % stage_name() -> count
+                  task_failed        :: dict(), % stage_name() -> count
+                  stage_results      :: dict(), % stage_name() -> results
+                  job_results = none :: none | [url() | [url()]]}).
 -type job_ent() :: #job_ent{}.
 
--spec new_job_ent(pid()) -> job_ent().
-new_job_ent(JobCoord) ->
-    new_job_ent(JobCoord, [map, reduce]).
-new_job_ent(JobCoord, Phases) ->
-    Counts = [{P, 0} || P <- Phases],
-    TaskReady = dict:from_list(Counts),
-    TaskFailed = dict:from_list(Counts),
-    PhaseResults = dict:new(),
+-spec new_job_ent(pid(), [stage_name()]) -> job_ent().
+new_job_ent(JobCoord, Stages) ->
+    InitCounts = dict:from_list([{S, 0} || S <- Stages]),
+    StageResults = dict:new(),
     #job_ent{job_coord = JobCoord,
-             start = now(),
-             task_ready = TaskReady,
-             task_failed = TaskFailed,
-             phase_results = PhaseResults}.
+             start     = now(),
+             task_count    = InitCounts,
+             task_ready    = InitCounts,
+             task_failed   = InitCounts,
+             stage_results = StageResults}.
 
 -spec update_job_ent(job_ent(), event()) -> job_ent().
 update_job_ent(JE, {job_data, JobData}) ->
     JE#job_ent{job_data = JobData};
-update_job_ent(#job_ent{task_ready = TaskReady} = JE, {task_ready, Phase}) ->
-    JE#job_ent{task_ready = dict:update_counter(Phase, 1, TaskReady)};
-update_job_ent(#job_ent{task_failed = TaskFailed} = JE, {task_failed, Phase}) ->
-    JE#job_ent{task_failed = dict:update_counter(Phase, 1, TaskFailed)};
-update_job_ent(#job_ent{phase_results = PhaseResults} = JE, {map_ready, Res}) ->
-    JE#job_ent{phase_results = dict:store(map, Res, PhaseResults)};
-update_job_ent(#job_ent{phase_results = PhaseResults} = JE, {reduce_ready, Res}) ->
-    JE#job_ent{phase_results = dict:store(reduce, Res, PhaseResults)};
+update_job_ent(#job_ent{task_count = TaskCount} = JE, {stage_start, Stage, Tasks}) ->
+    JE#job_ent{task_count = dict:store(Stage, Tasks, TaskCount)};
+update_job_ent(#job_ent{task_ready = TaskReady} = JE, {task_ready, Stage}) ->
+    JE#job_ent{task_ready = dict:update_counter(Stage, 1, TaskReady)};
+update_job_ent(#job_ent{task_failed = TaskFailed} = JE, {task_failed, Stage}) ->
+    JE#job_ent{task_failed = dict:update_counter(Stage, 1, TaskFailed)};
+update_job_ent(#job_ent{stage_results = Results} = JE, {stage_ready, S, R}) ->
+    JE#job_ent{stage_results = dict:store(S, R, Results)};
 update_job_ent(JE, {ready, Results}) ->
     JE#job_ent{job_results = Results}.
 
 -spec job_status(job_ent()) -> job_status().
 job_status(#job_ent{job_coord = Pid, job_results = none}) ->
     case is_process_alive(Pid) of
-        true -> active;
+        true  -> active;
         false -> dead
     end;
 job_status(_JE) ->
@@ -279,7 +305,7 @@ do_get_job_msgs(JobName, Query, N0, MsgBuf) ->
 
 -spec do_get_results(jobname(), dict())
                     -> invalid_job | {job_status(), pid()}
-                           | {ready, pid(), [job_coordinator:input()]}.
+                           | {ready, pid(), [url() | [url()]]}.
 do_get_results(JobName, Events) ->
     case dict:find(JobName, Events) of
         error ->
@@ -292,13 +318,13 @@ do_get_results(JobName, Events) ->
 
 -spec do_get_map_results(jobname(), dict())
                         -> invalid_job | not_ready
-                               | {ok, [job_coordinator:input()]}.
+                               | {ok, [[url()]]}.
 do_get_map_results(JobName, Events) ->
     case dict:find(JobName, Events) of
         error ->
             invalid_job;
-        {ok, #job_ent{phase_results = PR}} ->
-            case dict:find(map, PR) of
+        {ok, #job_ent{stage_results = PR}} ->
+            case dict:find(?MAP, PR) of
                 error -> not_ready;
                 {ok, _Res} = Ret -> Ret
             end
@@ -310,20 +336,22 @@ do_get_jobinfo(JobName, Events) ->
         error ->
             invalid_job;
         {ok, #job_ent{start = Start, job_data = JobNfo, job_results = Results,
-                      task_ready = Ready, task_failed = Failed} = JE} ->
+                      task_count = Count, task_ready = Ready,
+                      task_failed = Failed} = JE} ->
             {ok, {Start, job_status(JE), JobNfo,
                   case Results of none -> []; _ -> Results end,
-                  Ready, Failed}}
+                  Count, Ready, Failed}}
     end.
 
 -spec do_add_job_event(host(), jobname(), binary(), event(), state()) -> state().
-do_add_job_event(Host, JobName, Msg, Event, {_Events, MsgBuf} = S) ->
+do_add_job_event(Host, JobName, Msg, Event, #state{msgbuf = MsgBuf} = S) ->
     case dict:is_key(JobName, MsgBuf) of
         true -> add_event(Host, JobName, Msg, Event, S);
         false -> S
     end.
 
-add_event(Host0, JobName, Msg, Event, {Events, MsgBuf}) ->
+add_event(Host0, JobName, Msg, Event,
+          #state{events = Events, msgbuf = MsgBuf} = S) ->
     {ok, {NMsg, LstLen0, MsgLst0}} = dict:find(JobName, MsgBuf),
     Time = disco_util:format_timestamp(now()),
     Host = list_to_binary(Host0),
@@ -346,15 +374,15 @@ add_event(Host0, JobName, Msg, Event, {Events, MsgBuf}) ->
     MsgBufN = dict:store(JobName, {NMsg + 1, LstLen, MsgLst}, MsgBuf),
     if
         Event =:= none ->
-            {Events, MsgBufN};
+            S#state{events = Events, msgbuf = MsgBufN};
         true ->
             {ok, JE} = dict:find(JobName, Events),
-            {dict:store(JobName, update_job_ent(JE, Event), Events),
-             MsgBufN}
+            EventsN = dict:store(JobName, update_job_ent(JE, Event), Events),
+            S#state{events = EventsN, msgbuf = MsgBufN}
     end.
 
 -spec do_job_done(jobname(), state()) -> state().
-do_job_done(JobName, {Events, MsgBuf} = S) ->
+do_job_done(JobName, #state{msgbuf = MsgBuf} = S) ->
     case ets:lookup(event_files, JobName) of
         [] ->
             ok;
@@ -364,16 +392,28 @@ do_job_done(JobName, {Events, MsgBuf} = S) ->
     end,
     case dict:find(JobName, MsgBuf) of
         error -> S;
-        {ok, _} -> {Events, dict:erase(JobName, MsgBuf)}
+        {ok, _} -> S#state{msgbuf = dict:erase(JobName, MsgBuf)}
+    end.
+
+-spec do_job_done_event(jobname(), [url() | [url()]], state()) -> state().
+do_job_done_event(JobName, Results, #state{events = Events} = S) ->
+    case dict:find(JobName, Events) of
+        {ok, #job_ent{start = Start}} ->
+            Msg = disco:format("\"READY: Job done in ~s\"",
+                               [disco:format_time_since(Start)]),
+            Event = {ready, Results},
+            add_event("master", JobName, list_to_binary(Msg), Event, S);
+        error ->
+            S
     end.
 
 % Flush events from memory to file using a per-job process.
 
-job_event_handler(JobName, JobCoordinator) ->
+job_event_handler(JobName, Hosts, JobCoordinator) ->
     {ok, _JobHome} = disco:make_dir(disco:jobhome(JobName)),
     {ok, File} = file:open(event_log(JobName), [append, raw]),
     gen_server:call(?MODULE, {job_initialized, JobName, self()}),
-    gen_server:reply(JobCoordinator, {ok, JobName}),
+    gen_server:reply(JobCoordinator, {ok, JobName, Hosts}),
     {ok, _} = timer:send_after(?EVENT_BUFFER_TIMEOUT, flush),
     job_event_handler_do(File, [], 0).
 
@@ -423,11 +463,6 @@ unique_key(Prefix, Dict) ->
             true -> unique_key(Prefix, Dict)
         end
     end.
-
-task_format(Msg) when is_atom(Msg) or is_binary(Msg) or is_list(Msg) ->
-    "~s";
-task_format(_Msg) ->
-    "~w".
 
 % Utilities to process job event file.
 

@@ -34,7 +34,7 @@ function Node(host, info){
         elmt.append($.create("div", {"class": "nodebox " + blacklisted},
                              [title, status, disk, val_ok, val_data, val_err]));
         $.map(self.info.tasks || [], self.show_task);
-    }
+    };
 
     self.show_task = function(task){
         $(".status#" + self.id + " > .jbox#free:first")
@@ -44,13 +44,13 @@ function Node(host, info){
             .click(function(){
                 $("#joblist input").val(task);
             });
-    }
+    };
 }
 
 function update_nodeboxes(data){
     $("#nodes").empty();
     var hosts = [];
-    for (host in data)
+    for (var host in data)
         hosts.push(host);
     hosts.sort();
     $.each(hosts, function(i, host){
@@ -67,10 +67,10 @@ function update_gcstats(data){
     if (typeof(data) === "string")
         $("#gcstats").text(data);
     else {
-        $("#gcstats").append(String("At: " + data["timestamp"]));
+        $("#gcstats").append(String("At: " + data.timestamp));
         var thd = $("<thead><tr><td/> <td>Files</td> <td>Bytes</td></tr></thead>");
         var tbd = $.create("tbody", {}, []);
-        $.each(data["stats"], function(typ, stats){
+        $.each(data.stats, function(typ, stats){
             $(tbd).append($.create("tr", {"class": "gcstat"},
                                    [$.create("td", {}, [String(typ)]),
                                     $.create("td", {}, [String(stats[0])]),
@@ -85,11 +85,15 @@ function update_gcstats(data){
 }
 
 function update_gcstatus(data){
-    $("#gcstatus").unbind('click').empty();
-    if (data === "")
-        $("#gcstatus").append('<a href="#">Start GC</a>').show().click(start_gc);
-    else
+    $("#gcstatus").off('click').empty();
+    if (data === "") {
+        $("#gcstatus")
+            .append('<a href="#">Start GC</a>')
+            .show()
+            .on("click", start_gc);
+    } else {
         $("#gcstatus").text(data);
+    }
     setTimeout(function(){
         $.getJSON("/ddfs/ctrl/gc_status", update_gcstatus);
     }, 10000);
@@ -97,6 +101,10 @@ function update_gcstatus(data){
 
 function start_gc(){
     $.getJSON("/ddfs/ctrl/gc_start", function(resp){
-        $("#gcstatus").unbind('click').text(resp).show().fadeOut(2000);
+        $("#gcstatus")
+            .off('click')
+            .text(resp)
+            .show()
+            .fadeOut(2000);
     });
 }

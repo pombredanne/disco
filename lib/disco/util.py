@@ -151,8 +151,8 @@ def globalize(object, globals):
 
 def urljoin(scheme_netloc_path):
     scheme, netloc, path = scheme_netloc_path
-    return ('{0}{1}{2}'.format('{0}://'.format(scheme if scheme else ''),
-                               '{0}/'.format(netloc if netloc else ''),
+    return ('{0}{1}{2}'.format('{0}://'.format(scheme) if scheme else '',
+                               '{0}/'.format(netloc) if netloc else '',
                                path))
 
 def schemesplit(url):
@@ -266,7 +266,7 @@ def deref(inputs, resolve=False):
     for input in inputlist(inputs):
         yield [resolve(i) for i in iterify(input)]
 
-def parse_dir(dir, partition=None):
+def parse_dir(dir, label=None):
     """
     Translates a directory URL (``dir://...``) to a list of normal URLs.
 
@@ -276,7 +276,7 @@ def parse_dir(dir, partition=None):
     :param dir: a directory url, such as ``dir://nx02/test_simple@12243344``
     """
     # XXX: guarantee indices are read in the same order (task/labels) (for redundancy)
-    return [url for id, url in sorted(read_index(dir)) if partition in (None, id)]
+    return [url for lab, url, size in sorted(read_index(dir)) if label in (None, lab)]
 
 def proxy_url(url, proxy=DiscoSettings()['DISCO_PROXY'], meth='GET', to_master=True):
     scheme, (host, port), path = urlsplit(url)
@@ -287,24 +287,27 @@ def proxy_url(url, proxy=DiscoSettings()['DISCO_PROXY'], meth='GET', to_master=T
     return url
 
 def read_index(dir):
+    # We might be given replicas of dirs; choose the first.
+    if isiterable(dir): dir = dir[0]
     from disco.comm import open_url
     file = open_url(proxy_url(dir, to_master=False))
     if dir.endswith(".gz"):
         file = gzip.GzipFile(fileobj=file)
     for line in file:
-        yield bytes_to_str(line).split()
+        label, url, size = bytes_to_str(line).split()
+        yield int(label), url, int(size)
 
 def ispartitioned(input):
     if isiterable(input):
         return all(ispartitioned(i) for i in input) and len(input)
     return input.startswith('dir://')
 
-def inputexpand(input, partition=None, settings=DiscoSettings()):
+def inputexpand(input, label=None, settings=DiscoSettings()):
     from disco.ddfs import DDFS, istag
-    if ispartitioned(input) and partition is not False:
-        return zip(*(parse_dir(i, partition=partition) for i in iterify(input)))
+    if ispartitioned(input) and label is not False:
+        return zip(*(parse_dir(i, label=label) for i in iterify(input)))
     if isiterable(input):
-        return [inputlist(input, partition=partition, settings=settings)]
+        return [inputlist(input, label=label, settings=settings)]
     if istag(input):
         ddfs = DDFS(settings=settings)
         return chainify(blobs for name, tags, blobs in ddfs.findtags(input))

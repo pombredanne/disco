@@ -34,21 +34,13 @@ import os
 from disco import util, worker
 from disco.worker.classic import external
 from disco.worker.classic.func import * # XXX: hack so func fns dont need to import
+from disco import JOBPACK_VERSION1
+from disco.worker import Params
 
 class Worker(worker.Worker):
     """
     A :class:`disco.worker.Worker`, which additionally supports the following parameters,
     to maintain the **Classic Disco Interface**:
-
-        .. note:: The classic worker tries to guess which modules are needed automatically,
-                  for all of the :term:`job functions` specified below,
-                  if the *required_modules* parameter is not specified.
-                  It sends any local dependencies
-                  (i.e. modules not included in the Python standard library)
-                  to nodes by default.
-
-                  If guessing fails, or you have other requirements,
-                  see :mod:`disco.worker.classic.modutil` for options.
 
     :type  map: :func:`disco.worker.classic.func.map`
     :param map: a function that defines the map task.
@@ -59,31 +51,31 @@ class Worker(worker.Worker):
 
                      .. deprecated:: 0.4
                                 *map_init* has not been needed ever since
-                                :func:`InputStreams <disco.worker.classic.func.InputStream>`
+                                :func:`InputStreams <disco.worker.task_io.InputStream>`
                                 were introduced.
                                 Use *map_input_stream* and/or *map_reader* instead.
 
-    :type  map_input_stream: sequence of :func:`disco.worker.classic.func.input_stream`
+    :type  map_input_stream: sequence of :func:`disco.worker.task_io.input_stream`
     :param map_input_stream: The given functions are chained together and the final resulting
-                             :class:`disco.worker.classic.func.InputStream` object is used
+                             :class:`disco.worker.task_io.InputStream` object is used
                              to iterate over input entries.
 
                              .. versionadded:: 0.2.4
 
-    :type  map_output_stream: sequence of :func:`disco.worker.classic.func.output_stream`
+    :type  map_output_stream: sequence of :func:`disco.worker.task_io.output_stream`
     :param map_output_stream: The given functions are chained together and the
-                              :meth:`disco.worker.classic.func.OutputStream.add` method of the last
-                              returned :class:`disco.worker.classic.func.OutputStream` object is used
+                              :meth:`disco.worker.task_io.OutputStream.add` method of the last
+                              returned :class:`disco.worker.task_io.OutputStream` object is used
                               to serialize key, value pairs output by the map.
 
                               .. versionadded:: 0.2.4
 
-    :type  map_reader: ``None`` or :func:`disco.worker.classic.func.input_stream`
-    :param map_reader: Convenience function to define the last :func:`disco.worker.classic.func.input_stream`
+    :type  map_reader: ``None`` or :func:`disco.worker.task_io.input_stream`
+    :param map_reader: Convenience function to define the last :func:`disco.worker.task_io.input_stream`
                        function in the *map_input_stream* chain.
 
                        If you want to use outputs of an earlier job as inputs,
-                       use :func:`disco.worker.classic.func.chain_reader` as the *map_reader*.
+                       use :func:`disco.worker.task_io.chain_reader` as the *map_reader*.
 
                        .. versionchanged:: 0.3.1
                           The default is ``None``.
@@ -109,50 +101,36 @@ class Worker(worker.Worker):
     :param reduce_init: initialization function for the reduce task.
                         This function is called once before the task starts.
 
-                     .. deprecated:: 0.4
+                        .. deprecated:: 0.4
                                 *reduce_init* has not been needed ever since
-                                :func:`InputStreams <disco.worker.classic.func.InputStream>`
+                                :func:`InputStreams <disco.worker.task_io.InputStream>`
                                 were introduced.
                                 Use *reduce_input_stream* and/or *reduce_reader* instead.
 
-    :type  reduce_input_stream: sequence of :func:`disco.worker.classic.func.output_stream`
+    :type  reduce_input_stream: sequence of :func:`disco.worker.task_io.output_stream`
     :param reduce_input_stream: The given functions are chained together and the last
-                              returned :class:`disco.worker.classic.func.InputStream` object is
+                              returned :class:`disco.worker.task_io.InputStream` object is
                               given to *reduce* as its first argument.
 
                               .. versionadded:: 0.2.4
 
-    :type  reduce_output_stream: sequence of :func:`disco.worker.classic.func.output_stream`
+    :type  reduce_output_stream: sequence of :func:`disco.worker.task_io.output_stream`
     :param reduce_output_stream: The given functions are chained together and the last
-                              returned :class:`disco.worker.classic.func.OutputStream` object is
+                              returned :class:`disco.worker.task_io.OutputStream` object is
                               given to *reduce* as its second argument.
 
                               .. versionadded:: 0.2.4
 
-    :type  reduce_reader: :func:`disco.worker.classic.func.input_stream`
-    :param reduce_reader: Convenience function to define the last :func:`disco.worker.classic.func.input_stream`
+    :type  reduce_reader: :func:`disco.worker.task_io.input_stream`
+    :param reduce_reader: Convenience function to define the last :func:`disco.worker.task_io.input_stream`
                           if *map* is specified.
                           If *map* is not specified,
                           you can read arbitrary inputs with this function,
                           similar to *map_reader*.
 
-                          Default is :func:`disco.worker.classic.func.chain_reader`.
+                          Default is :func:`disco.worker.task_io.chain_reader`.
 
                           .. versionadded:: 0.2
-
-    :type  required_files: list of paths or dict
-    :param required_files: additional files that are required by the worker.
-                           Either a list of paths to files to include,
-                           or a dictionary which contains items of the form
-                           ``(filename, filecontents)``.
-
-                           .. versionchanged:: 0.4
-                              The worker includes *required_files* in :meth:`jobzip`,
-                              so they are available relative to the working directory
-                              of the worker.
-
-    :type  required_modules: see :ref:`modspec`
-    :param required_modules: required modules to send with the worker.
 
     :type  merge_partitions: bool
     :param merge_partitions: whether or not to merge partitioned inputs during reduce.
@@ -220,57 +198,129 @@ class Worker(worker.Worker):
 
                             Default is ``100000``.
     """
+
+    jobpack_version = JOBPACK_VERSION1
+
     def defaults(self):
         defaults = super(Worker, self).defaults()
-        defaults.update({'map_init': init,
+        defaults.update({'map': None,
+                         'map_init': init,
                          'map_reader': None,
                          'map_input_stream': (map_input_stream, ),
                          'map_output_stream': (map_output_stream,
                                                disco_output_stream),
+                         'map_shuffle': None,
                          'combiner': None,
+                         'merge_partitions': False, # XXX: maybe deprecated
                          'partition': default_partition,
+                         'partitions': 1,
+                         'reduce': None,
                          'reduce_init': init,
                          'reduce_reader': chain_reader,
                          'reduce_input_stream': (reduce_input_stream, ),
                          'reduce_output_stream': (reduce_output_stream,
                                                   disco_output_stream),
-                         'required_files': {},
-                         'required_modules': None,
+                         'reduce_shuffle': None,
                          'ext_params': {},
                          'params': Params(),
+                         'shuffle': None,
                          'sort': False,
                          'sort_buffer_size': '10%',
                          'status_interval': 100000,
                          'version': '.'.join(str(s) for s in sys.version_info[:2])})
         return defaults
 
-    def jobenvs(self, job, **jobargs):
-        envs = super(Worker, self).jobenvs(job, **jobargs)
-        envs['LD_LIBRARY_PATH'] = 'lib'
-        envs['PYTHONPATH'] = ':'.join(('lib', envs.get('PYTHONPATH', '')))
-        return envs
+    def get_modules(self, job, **jobargs):
+        from disco.worker.modutil import find_modules
+        from disco.util import iterify
+        def get(key):
+            return self.getitem(key, job, jobargs)
+        return find_modules([obj
+                             for key in self
+                             for obj in iterify(get(key))
+                             if callable(obj)],
+                            exclude=['Task'])
+
+    def jobdict(self, job, **jobargs):
+        """
+        Creates :ref:`jobdict` for the :class:`Worker`.
+
+        Makes use of the following parameters, in addition to those
+        defined by the :class:`Worker` itself:
+
+        :type  input: list of urls or list of list of urls
+        :param input: used to set :attr:`jobdict.input`.
+                Disco natively handles the following url schemes:
+
+                * ``http://...`` - any HTTP address
+                * ``file://...`` or no scheme - a local file.
+                    The file must exist on all nodes where the tasks are run.
+                    Due to these restrictions, this form has only limited use.
+                * ``tag://...`` - a tag stored in :ref:`DDFS`
+                * ``raw://...`` - pseudo-address: use the address itself as data.
+                * ``dir://...`` - used by Disco internally.
+                * ``disco://...`` - used by Disco internally.
+
+                .. seealso:: :mod:`disco.schemes`.
+
+        :type  scheduler: dict
+        :param scheduler: directly sets :attr:`jobdict.scheduler`.
+
+                          .. deprecated:: 0.5
+                                  *scheduler* params are now ignored.
+
+        Uses :meth:`getitem` to resolve the values of parameters.
+
+        :return: the :term:`job dict`.
+        """
+        from disco.util import isiterable, inputlist, ispartitioned, read_index
+        from disco.error import DiscoError
+        def get(key, default=None):
+            return self.getitem(key, job, jobargs, default)
+        has_map = bool(get('map'))
+        has_reduce = bool(get('reduce'))
+        job_input = get('input', [])
+        has_save_results = get('save', False) or get('save_results', False)
+        if not isiterable(job_input):
+            raise DiscoError("Job 'input' is not a list of input locations,"
+                             "or a list of such lists: {0}".format(job_input))
+        input = inputlist(job_input,
+                          label=None if has_map else False,
+                          settings=job.settings)
+
+        # -- nr_reduces --
+        # ignored if there is not actually a reduce specified
+        # XXX: master should always handle this
+        if has_map:
+            # partitioned map has N reduces; non-partitioned map has 1 reduce
+            nr_reduces = get('partitions') or 1
+        elif ispartitioned(input):
+            # no map, with partitions: len(dir://) specifies nr_reduces
+            nr_reduces = 1 + max(int(id)
+                                 for dir in input
+                                 for id, url, size in read_index(dir))
+        else:
+            # no map, without partitions can only have 1 reduce
+            nr_reduces = 1
+
+        if get('merge_partitions'):
+            nr_reduces = 1
+
+        jobdict = super(Worker, self).jobdict(job, **jobargs)
+        jobdict.update({'input': input,
+                        'worker': self.bin,
+                        'map?': has_map,
+                        'reduce?': has_reduce,
+                        'nr_reduces': nr_reduces,
+                        'save_results': has_save_results,
+                        'scheduler': get('scheduler', {})})
+        return jobdict
 
     def jobzip(self, job, **jobargs):
-        from disco.util import iskv
-        from disco.worker.classic.modutil import find_modules
         jobzip = super(Worker, self).jobzip(job, **jobargs)
         def get(key):
             return self.getitem(key, job, jobargs)
-        if isinstance(get('required_files'), dict):
-            for path, bytes in get('required_files').items():
-                jobzip.writestr(path, bytes)
-        else:
-            for path in get('required_files'):
-                jobzip.write(path, os.path.join('lib', os.path.basename(path)))
-        if get('required_modules') is None:
-            self['required_modules'] = find_modules([obj
-                                                     for key in self
-                                                     for obj in util.iterify(get(key))
-                                                     if callable(obj)],
-                                                    exclude=['Task'])
-        for mod in get('required_modules'):
-            if iskv(mod):
-                jobzip.writepath(mod[1])
+        # Support for external interface.
         for func in ('map', 'reduce'):
             if isinstance(get(func), dict):
                 for path, bytes in get(func).items():
@@ -285,9 +335,9 @@ class Worker(worker.Worker):
         assert self['version'] == '{0[0]}.{0[1]}'.format(sys.version_info[:2]), "Python version mismatch"
 
         params = self['params']
-        if isinstance(self[task.mode], dict):
+        if isinstance(self[task.stage], dict):
             params = self['ext_params']
-            self[task.mode] = external.prepare(params, task.mode)
+            self[task.stage] = external.prepare(params, task.stage)
 
         globals_ = globals().copy()
         for module in self['required_modules']:
@@ -296,11 +346,11 @@ class Worker(worker.Worker):
         for obj in util.flatten(self.values()):
             util.globalize(obj, globals_)
 
-        getattr(self, task.mode)(task, params)
+        getattr(self, task.stage)(task, params)
         external.close()
 
     def map(self, task, params):
-        if self['save'] and self['partitions'] and not self['reduce']:
+        if self['save_results'] and self['partitions'] and not self['reduce']:
             raise NotImplementedError("Storing partitioned outputs in DDFS is not yet supported")
         entries = self.status_iter(self.input(task, open=self.opener('map', 'in', params)),
                                    "%s entries mapped")
@@ -312,7 +362,7 @@ class Worker(worker.Worker):
             for key, val in self['map'](entry, params):
                 part = None
                 if self['partitions']:
-                    part = str(self['partition'](key, self['partitions'], params))
+                    part = int(self['partition'](key, self['partitions'], params))
                 if self['combiner']:
                     if part not in bufs:
                         bufs[part] = {}
@@ -324,15 +374,31 @@ class Worker(worker.Worker):
             for record in self['combiner'](None, None, buf, True, params) or ():
                 output(part).add(*record)
 
+    def shuffle(self, task, params):
+        inputs = [i for i in self.get_inputs()]
+        getattr(self, 'shuffle_' + task.grouping)(task, params, inputs)
+
+    map_shuffle = reduce_shuffle = shuffle
+
+    def shuffle_group_node(self, task, params, inputs):
+        from disco.worker import BaseOutput
+        label_map = self.labelled_input_map(task, inputs)
+        for label in label_map:
+            if len(label_map[label]) > 0:
+                outpath, _size = self.concat_input(task, label, label_map[label])
+                self.outputs[label] = BaseOutput((outpath, 'disco', label))
+        self.send('MSG', ("Shuffled {0} inputs into {1} label(s)"
+                          .format(len(inputs), len(label_map))))
+
     def reduce_input(self, task, params):
         # master should feed only the partitioned inputs to reduce (and shuffle them?)
         from disco.worker import SerialInput
         from disco.util import inputlist, ispartitioned, shuffled
         inputs = [[url for rid, url in i.replicas] for i in self.get_inputs()]
-        partition = None
+        label = None
         if ispartitioned(inputs) and not self['merge_partitions']:
-            partition = str(task.taskid)
-        return self.sort(SerialInput(shuffled(inputlist(inputs, partition=partition)),
+            label = task.group_label
+        return self.sort(SerialInput(shuffled(inputlist(inputs, label=label)),
                                      task=task,
                                      open=self.opener('reduce', 'in', params)),
                          task)
@@ -376,48 +442,6 @@ class Worker(worker.Worker):
             return ClassicFile(url, streams, params)
         return open
 
-class ClassicFile(object):
-    def __init__(self, url, streams, params, fd=None, size=None):
-        self.fds = []
-        for stream in streams:
-            maybe_params = (params,) if util.argcount(stream) == 4 else ()
-            fd = stream(fd, size, url, *maybe_params)
-            if isinstance(fd, tuple):
-                if len(fd) == 3:
-                    fd, size, url = fd
-                else:
-                    fd, url = fd
-            self.fds.append(fd)
-
-    def __iter__(self):
-        return iter(self.fds[-1])
-
-    def close(self):
-        for fd in reversed(self.fds):
-            if hasattr(fd, 'close'):
-                fd.close()
-
-class Params(object):
-    """
-    .. deprecated:: 0.4
-              :class:`Params` objects aren't generally needed,
-              since entire modules are sent with the :class:`Worker`,
-              state can be stored as in normal Python.
-
-    Classic parameter container for map / reduce tasks.
-
-    This object provides a way to contain custom parameters,
-    or state, in your tasks.
-
-    You can specify any number of ``key, value`` pairs to the :class:`Params`.
-    The pairs will be available to task functions through the *params* argument.
-    Each task receives its own copy of the initial params object.
-    *key* must be a valid Python identifier.
-    *value* can be any Python object.
-    """
-    def __init__(self, **kwargs):
-        self.__dict__.update(kwargs)
-
 from disco.util import msg, err, data_err
 
 def get(*args, **kwargs):
@@ -455,7 +479,7 @@ def this_partition():
     identifies this partition. You can use a custom partitioning function to
     assign key-value pairs to a particular partition.
     """
-    return Task.taskid
+    return Task.group_label
 
 if __name__ == '__main__':
     Worker.main()

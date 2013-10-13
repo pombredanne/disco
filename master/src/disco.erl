@@ -1,15 +1,14 @@
 -module(disco).
 
--export([get_setting/1, has_setting/1, settings/0,
-         host/1, name/1, slave_name/1, slave_node/1, slave_safe/1, oob_name/1,
-         hexhash/1, jobhome/1, jobhome/2, joburl/2,
-         data_root/1, data_path/2, ddfs_root/2,
-         debug_flags/1, local_cluster/0,
-         disco_url_path/1, preferred_host/1,
-         enum/1, format/2, format_time/1, format_time/4, format_time_since/1,
-         make_dir/1, ensure_dir/1, is_file/1, is_dir/1]).
-
--export_type([url_host/0]).
+-export([get_setting/1, has_setting/1, settings/0]).
+-export([host/1, name/1]).
+-export([slave_name/1, slave_node/1, slave_safe/1, slave_for_url/1]).
+-export([jobhome/1, jobhome/2, joburl/2, joburl_to_localpath/1]).
+-export([data_root/1, data_path/2, ddfs_root/2]).
+-export([local_cluster/0, preferred_host/1, disco_url_path/1, dir_to_url/1]).
+-export([enum/1, hexhash/1, oob_name/1, debug_flags/1]).
+-export([format/2, format_time/1, format_time/4, format_time_since/1]).
+-export([make_dir/1, ensure_dir/1, is_file/1, is_dir/1]).
 
 -include_lib("kernel/include/file.hrl").
 
@@ -74,13 +73,17 @@ slave_node(Host) ->
 
 -spec slave_safe(host()) -> false | node().
 slave_safe(Host) ->
-    try
-        case local_cluster() of
+    try case local_cluster() of
             false -> list_to_existing_atom(default_slave_name() ++ "@" ++ Host);
             true  -> list_to_existing_atom(box_slave_name(Host) ++ "@localhost")
         end
     catch _:_ -> false
     end.
+
+-spec slave_for_url(url()) -> false | node().
+slave_for_url(Url) ->
+    {_S, Host, _P, _Q, _F} = mochiweb_util:urlsplit(binary_to_list(Url)),
+    slave_safe(Host).
 
 -spec host(node()) -> host().
 host(Node) ->
@@ -118,6 +121,12 @@ jobhome(JobName, Root) ->
 joburl(Host, JobName) ->
     filename:join(["disco", Host, hexhash(JobName), JobName]).
 
+-spec joburl_to_localpath(url()) -> path().
+joburl_to_localpath(Url) ->
+    {_S, _H, Path, _Q, _F} = mochiweb_util:urlsplit(binary_to_list(Url)),
+    ["/", "disco" | P] = filename:split(Path),
+    filename:join([get_setting("DISCO_DATA") | P]).
+
 -spec data_root(node() | nonempty_string()) -> path().
 data_root(Node) when is_atom(Node) ->
     data_root(host(Node));
@@ -141,7 +150,7 @@ debug_flags(Server) ->
         "trace" ->
             Root = disco:get_setting("DISCO_MASTER_ROOT"),
             [{debug, [{log_to_file,
-                filename:join(Root, Server ++ "_trace.log")}]}];
+                       filename:join(Root, Server ++ "_trace.log")}]}];
         _ -> []
     end.
 
@@ -149,7 +158,7 @@ debug_flags(Server) ->
 local_cluster() ->
     case os:getenv("DISCO_LOCAL_CLUSTER") of
         false -> false;
-        _ -> true
+        _     -> true
     end.
 
 -spec disco_url_path(file:filename()) -> [path()].
@@ -158,15 +167,23 @@ disco_url_path(Url) ->
     {match, [Path]} = re:run(Url, ".*?://.*?/disco/(.*)", Opts),
     Path.
 
+-spec dir_to_url(url()) -> url().
+dir_to_url(<<"dir://", _/binary>> = Dir) ->
+    {_S, Host, P, Q, F} = mochiweb_util:urlsplit(binary_to_list(Dir)),
+    Url = {"http", Host ++ ":" ++ get_setting("DISCO_PORT"), P, Q, F},
+    mochiweb_util:urlunsplit(Url);
+dir_to_url(<<_/binary>> = Url) ->
+    Url.
+
 -spec preferred_host(url()) -> url_host().
 preferred_host(Url) ->
     Opts = [{capture, all_but_first, binary}],
     case re:run(Url, "^[a-zA-Z0-9]+://([^/:]*)", Opts) of
         {match, [Match]} -> binary_to_list(Match);
-        nomatch -> none
+        nomatch          -> none
     end.
 
--spec enum([term()]) -> [{non_neg_integer(), term()}].
+-spec enum([T]) -> [{non_neg_integer(), T}].
 enum(List) ->
     lists:zip(lists:seq(0, length(List) - 1), List).
 
@@ -181,8 +198,8 @@ format_time(Ms) when is_integer(Ms) ->
                 (Ms rem ?HOUR) div ?MINUTE,
                 (Ms div ?HOUR)).
 
--spec format_time(integer(), integer(), integer(), integer()) ->
-                         nonempty_string().
+-spec format_time(integer(), integer(), integer(), integer())
+                 -> nonempty_string().
 format_time(Ms, Second, Minute, Hour) ->
     lists:flatten(io_lib:format("~B:~2.10.0B:~2.10.0B.~3.10.0B",
                                 [Hour, Minute, Second, Ms])).
@@ -196,38 +213,34 @@ make_dir(Dir) ->
     case ensure_dir(Dir) of
         ok ->
             case prim_file:make_dir(Dir) of
-                ok              -> {ok, Dir};
-                {error, eexist} -> {ok, Dir};
-                {error, Reason} -> {error, Reason}
+                ok                   -> {ok, Dir};
+                {error, eexist}      -> {ok, Dir};
+                {error, _Reason} = E -> E
             end;
-        {error, Reason} ->
-            {error, Reason}
+        {error, _Reason} = E ->
+            E
     end.
 
 % based on ensure_dir() in /usr/lib/erlang/lib/stdlib-1.17/src/filelib.erl
 
 -spec ensure_dir(file:filename()) -> ok | {error, file:posix()}.
-ensure_dir("/") ->
-    ok;
+ensure_dir("/") -> ok;
 ensure_dir(F) ->
     Dir = filename:dirname(F),
     case is_dir(Dir) of
-        true ->
+        true  ->
             ok;
         false ->
             case ensure_dir(Dir) of
-                ok ->
-                    case prim_file:make_dir(Dir) of
-                        {error, eexist} = EExist ->
-                            case is_dir(Dir) of
-                                true  -> ok;
-                                false -> EExist
-                            end;
-                        Err ->
-                            Err
-                    end;
-                Err ->
-                    Err
+                ok -> case prim_file:make_dir(Dir) of
+                          {error, eexist} = EExist ->
+                              case is_dir(Dir) of
+                                  true  -> ok;
+                                  false -> EExist
+                              end;
+                          Err -> Err
+                      end;
+                Err -> Err
             end
     end.
 
