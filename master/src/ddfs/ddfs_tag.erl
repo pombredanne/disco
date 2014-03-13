@@ -702,7 +702,7 @@ put_distribute(_, K, OkNodes, _Exclude) when K == length(OkNodes) ->
 put_distribute({TagID, TagData} = Msg, K, OkNodes, Exclude) ->
     TagMinK = get(min_tagk),
     K0 = K - length(OkNodes),
-    {ok, Nodes} = ddfs_master:choose_write_nodes(K0, Exclude),
+    {ok, Nodes} = ddfs_master:choose_write_nodes(K0, [], Exclude),
     if
         Nodes =:= [], length(OkNodes) < TagMinK ->
             {error, replication_failed};
@@ -751,7 +751,7 @@ do_delete(ReplyTo, #state{tag = Tag} = S) ->
 -spec is_tag_deleted(tagname()) -> _.
 is_tag_deleted(<<"+deleted">>) -> false;
 is_tag_deleted(Tag) ->
-    deleted_op({has_tagname, Tag}, ?NODEOP_TIMEOUT).
+    deleted_op({has_tagname, Tag}, infinity).
 
 -spec add_to_deleted(tagname()) -> _.
 add_to_deleted(Tag) ->
@@ -762,5 +762,6 @@ add_to_deleted(Tag) ->
 remove_from_deleted(Tags) ->
     deleted_op({delete_tagnames, Tags}, ?NODEOP_TIMEOUT).
 
+-spec deleted_op(term(), non_neg_integer() | infinity) -> term().
 deleted_op(Op, Timeout) ->
     ddfs_master:tag_operation(Op, <<"+deleted">>, Timeout).

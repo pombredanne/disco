@@ -37,6 +37,8 @@ class OptionParser(clx.OptionParser):
         clx.OptionParser.__init__(self, option_class=Option, **kwargs)
         self.add_option('-t', '--token',
                         help='authorization token to use for tags')
+        self.add_option('-M', '--master',
+                        help='set master of ddfs')
 
 class Program(clx.Program):
     def __init__(self, *args, **kwargs):
@@ -45,6 +47,13 @@ class Program(clx.Program):
         if token is not None:
             self.settings['DDFS_READ_TOKEN']  = token
             self.settings['DDFS_WRITE_TOKEN'] = token
+
+        master = self.options.master
+        if master is not None:
+            if master.find(':') == -1:
+                port = self.settings['DISCO_PORT']
+                master += ':' + str(port)
+            self.settings['DISCO_MASTER'] = master
 
     @classmethod
     def add_classic_reads(cls, command):
@@ -199,8 +208,10 @@ class Master(clx.server.Server):
             return ['-lager', 'handlers',
                     ('[{lager_console_backend, info},'
                      +'{lager_file_backend,'
-                     +' [{' + '"{0}/error.log"'.format(log_dir)   + ', error, 1048576000, "$D0", 5},'
-                     +'  {' + '"{0}/console.log"'.format(log_dir) + ', debug, 1048576000, "$D0", 5}]}]'),
+                     +'[{file,' + '"{0}/error.log"'.format(log_dir)   + '}, {level, error}, {size, 1048576000}, {date, "$D0"}, {count, 5}]},'
+                     +'{lager_file_backend,'
+                     +'[{file,' + '"{0}/console.log"'.format(log_dir) + '}, {level, debug}, {size, 1048576000}, {date, "$D0"}, {count, 5}]}]'),
+                    '-lager', 'error_logger_hwm', '200',
                     '-lager', 'crash_log', '"{0}/crash.log"'.format(log_dir)]
         ret = (settings['DISCO_ERLANG'].split() +
                 lager_config(settings['DISCO_LOG_DIR']) +
@@ -211,6 +222,7 @@ class Master(clx.server.Server):
                  '-sname', self.name,
                  '-pa', epath('ebin'),
                  '-pa', edep('mochiweb'),
+                 '-pa', edep('goldrush'),
                  '-pa', edep('lager'),
                  '-eval', 'application:start(disco)'])
         return ret

@@ -415,6 +415,7 @@ class Worker(worker.Worker):
             self['reduce'](entries, output, params)
 
     def sort(self, input, task):
+        from disco.util import disk_sort
         if self['sort']:
             return disk_sort(self,
                              input,
@@ -442,7 +443,6 @@ class Worker(worker.Worker):
             return ClassicFile(url, streams, params)
         return open
 
-from disco.util import msg, err, data_err
 
 def get(*args, **kwargs):
     """See :meth:`disco.task.Task.get`."""

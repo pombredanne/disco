@@ -3,8 +3,9 @@
 Release notes
 =============
 
-Disco 0.5 (TBD)
+Disco 0.5 (February 14, 2014)
 ---------------
+This release is dedicated to the memory of Priya Hattiangdi, Prashanth Mundkur's wife, who has passed away a few days ago. May she rest in peace.
 
 New features
 ''''''''''''
@@ -64,6 +65,13 @@ The new pipeline model comes with several changes.
 - The web UI for jobs has changed slightly in order to show the stages
   of a job pipeline.
 
+- Disco now uses lager 2.0 which can be integrated with syslog.
+
+- Disco now works on FreeBSD 10.0.
+
+- A continuous integration has been set up to compile the Erlang code,
+  and make sure it passes the dialyzer and all of the unittests.
+
 Backwards incompatible changes
 ''''''''''''''''''''''''''''''
 - See above discussion of the Disco worker protocol.
@@ -92,7 +100,7 @@ Backwards incompatible changes
 
 Bugfixes
 ''''''''
-TBD.
+Please see the version control for the list of bug fixes.
 
 Disco 0.4.5 (Mar 28, 2013)
 --------------------------

@@ -1,7 +1,5 @@
-export
-
-DISCO_VERSION = 0.4.5
-DISCO_RELEASE = 0.4.5
+DISCO_VERSION = 0.5.0
+DISCO_RELEASE = 0.5.0
 
 # standard make installation variables
 sysconfdir    = /etc
@@ -27,18 +25,15 @@ RELCFG = $(sysconfdir)/disco
 RELSRV = $(localstatedir)/disco
 
 # installation directories
-TARGETBIN = $(DESTDIR)$(RELBIN)
-TARGETLIB = $(DESTDIR)$(RELLIB)
-TARGETDAT = $(DESTDIR)$(RELDAT)
-TARGETCFG = $(DESTDIR)$(RELCFG)
-TARGETSRV = $(DESTDIR)$(RELSRV)
+export TARGETBIN = $(DESTDIR)$(RELBIN)
+export TARGETLIB = $(DESTDIR)$(RELLIB)
+export TARGETDAT = $(DESTDIR)$(RELDAT)
+export TARGETCFG = $(DESTDIR)$(RELCFG)
+export TARGETSRV = $(DESTDIR)$(RELSRV)
 
 # options to python and sphinx for building the lib and docs
 PYTHONENVS = DISCO_VERSION=$(DISCO_VERSION) DISCO_RELEASE=$(DISCO_RELEASE)
 SPHINXOPTS = -D version=$(DISCO_VERSION) -D release=$(DISCO_RELEASE)
-
-# used to choose which conf file will be generated
-UNAME = $(shell uname)
 
 # utilities used for building disco
 DIALYZER   = dialyzer
@@ -46,12 +41,12 @@ TYPER      = typer
 PYTHON     = python
 PY_INSTALL = $(PYTHONENVS) $(PYTHON) setup.py install --root=$(DESTDIR)/ --prefix=$(prefix) $(PY_INSTALL_OPTS)
 
-WWW   = master/www
+export WWW   = master/www
 EBIN  = master/ebin
 ESRC  = master/src
 EDEP  = master/deps
 
-DEPS     = mochiweb lager
+DEPS     = mochiweb lager goldrush
 EDEPS    = $(foreach dep,$(DEPS),$(EDEP)/$(dep)/ebin)
 ELIBS    = $(ESRC) $(ESRC)/ddfs
 ESOURCES = $(foreach lib,$(ELIBS),$(wildcard $(lib)/*.erl))
@@ -83,8 +78,15 @@ clean:
 xref: master
 	@ (cd master && ./rebar xref)
 
-test:
-	@ (cd master && ./rebar -C eunit.config get-deps eunit)
+erlangtest:
+	@ (cd master && ./rebar -C eunit.config clean get-deps compile &&\
+	./rebar -C eunit.config eunit skip_deps=true && cd -)
+
+pythontest:
+	@ (cd lib && python setup.py install --user)
+	@ (cd lib/test && pip install nose --user && PATH=${PATH}:~/.local/bin nosetests)
+
+test: pythontest dialyzer erlangtest
 
 contrib:
 	git submodule init
@@ -137,6 +139,10 @@ install-node: master \
 	$(addprefix $(TARGETLIB)/,$(EDEPS)) \
 	$(TARGETSRV)
 
+$(TARGETLIB)/$(EBIN):
+	$(INSTALL) -d $(@D)
+	$(INSTALL_TREE) $(EBIN) $(@D)
+
 uninstall-node:
 	- rm -Rf $(TARGETLIB) $(TARGETSRV)
 
@@ -159,13 +165,22 @@ $(TARGETDAT)/% $(TARGETLIB)/%: %
 	$(INSTALL) -d $(@D)
 	$(INSTALL_TREE) $< $(@D)
 
-$(TARGETBIN)/%: bin/%
+$(TARGETDAT)/$(WWW) $(TARGETLIB)/$(WWW): $(WWW)
 	$(INSTALL) -d $(@D)
-	$(INSTALL_PROGRAM) $< $@
+	$(INSTALL_TREE) $(WWW) $(@D)
+
+
+$(TARGETBIN)/disco: bin/disco
+	$(INSTALL) -d $(@D)
+	$(INSTALL_PROGRAM) bin/disco $@
+
+$(TARGETBIN)/ddfs: bin/ddfs
+	$(INSTALL) -d $(@D)
+	$(INSTALL_PROGRAM) bin/ddfs $@
 
 $(TARGETCFG)/settings.py:
 	$(INSTALL) -d $(@D)
-	(cd conf && ./gen.settings.sys-$(UNAME) > $@ && chmod 644 $@)
+	(cd conf && ./gen.settings.sys-`uname -s` > $@ && chmod 644 $@)
 
 $(TARGETSRV):
 	$(INSTALL) -d $@
