@@ -1,9 +1,9 @@
-DISCO_VERSION = 0.5.1
-DISCO_RELEASE = 0.5.1
+DISCO_VERSION = 0.5.4
+DISCO_RELEASE = 0.5.4
 
 # standard make installation variables
 sysconfdir    = /etc
-prefix        = /usr/local
+prefix        = /usr
 exec_prefix   = $(prefix)
 localstatedir = $(prefix)/var
 datarootdir   = $(prefix)/share
@@ -50,7 +50,7 @@ EBIN  = master/ebin
 ESRC  = master/src
 EDEP  = master/deps
 
-DEPS     = mochiweb lager goldrush folsom bear meck folsomite
+DEPS     = mochiweb lager goldrush folsom bear meck folsomite plists
 EDEPS    = $(foreach dep,$(DEPS),$(EDEP)/$(dep)/ebin)
 ELIBS    = $(ESRC) $(ESRC)/ddfs
 ESOURCES = $(foreach lib,$(ELIBS),$(wildcard $(lib)/*.erl))

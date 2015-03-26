@@ -224,9 +224,12 @@ class Master(clx.server.Server):
         SchedulerOptions = ['+K', 'true',
                 '+P', '10000000']
 
+        if settings["SYSTEMD_ENABLED"]:
+            SchedulerOptions.append("-noshell")
+
         for option, value in [('+scl', 'false'), ('+stbt', 's')]:
             if isErlOptionAvailable(option, value):
-                SchedulerOptions += [option, value]
+                SchedulerOptions += [option, value] + ["-env", option, value]
 
         ret = (settings['DISCO_ERLANG'].split() +
                 lager_config(settings['DISCO_LOG_DIR']) +
@@ -242,6 +245,7 @@ class Master(clx.server.Server):
                  '-pa', edep('bear'),
                  '-pa', edep('folsom'),
                  '-pa', edep('folsomite'),
+                 '-pa', edep('plists'),
                  '-eval', 'application:start(disco)'])
         return ret
 

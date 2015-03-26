@@ -28,7 +28,9 @@
 
 -type prioq_item() :: {priority(), pid(), jobname()}.
 -type prioq() :: [prioq_item()].
--type state() :: {gb_tree(), prioq(), cores()}.
+-type job_map() :: disco_gbtree(pid(), job()).
+-type state() :: {job_map(), prioq(), cores()}.
+
 
 -spec start_link() -> {ok, pid()}.
 start_link() ->
@@ -85,7 +87,7 @@ handle_cast({new_job, JobPid, JobName}, {Jobs, PrioQ, NC}) ->
                          gs_reply([{jobname(), priority()}]);
                  (dbg_state_msg(), from(), state()) -> gs_reply(state());
                  (next_job_msg(), from(), state()) -> gs_reply(next_job());
-                 (priv_get_jobs, from(), state()) -> gs_reply(gb_tree()).
+                 (priv_get_jobs, from(), state()) -> gs_reply(job_map()).
 
 % Return current priorities for the ui
 handle_call(current_priorities, _, {_, PrioQ, _} = S) ->
@@ -97,17 +99,21 @@ handle_call(dbg_get_state, _, S) ->
 handle_call({next_job, _}, _, {{0, _}, _, _} = S) ->
     {reply, nojobs, S};
 
-handle_call({next_job, NotJobs}, _, {{N, _}, _, _} = S)
-  when length(NotJobs) >= N ->
-    {reply, nojobs, S};
-
 % NotJobs lists all jobs that got 'none' reply from the
 % fair_scheduler_job task scheduler. We want to skip them.
+
+% There might be some job pids in the NotJobs list that are not in the priority
+% queue (like the jobs that just finished). Therefore we cannot compare the size
+% of the priority queue with the length of NotJobs.
 handle_call({next_job, NotJobs}, _, {Jobs, PrioQ, NC}) ->
-    {NextJob, RPrioQ} = dropwhile(PrioQ, [], NotJobs),
-    {UJobs, UPrioQ} = bias_priority(gb_trees:get(NextJob, Jobs),
-                                    RPrioQ, Jobs, NC),
-    {reply, {ok, NextJob}, {UJobs, UPrioQ, NC}};
+    case dropwhile(PrioQ, [], NotJobs) of
+        none ->
+            {reply, nojobs, {Jobs, PrioQ, NC}};
+        {NextJob, RPrioQ} ->
+            {UJobs, UPrioQ} = bias_priority(gb_trees:get(NextJob, Jobs),
+                                            RPrioQ, Jobs, NC),
+            {reply, {ok, NextJob}, {UJobs, UPrioQ, NC}}
+    end;
 
 handle_call(priv_get_jobs, _, {Jobs, _, _} = S) ->
     {reply, {ok, Jobs}, S}.
@@ -119,6 +125,10 @@ handle_info({'DOWN', _, _, JobPid, _}, {Jobs, PrioQ, NC}) ->
     {noreply, {gb_trees:delete(JobPid, Jobs),
                lists:keydelete(JobPid, 2, PrioQ), NC}}.
 
+% The list of the jobs has been exhausted but all of the jobs are in NotJobs
+% list
+dropwhile([], _, _) ->
+    none;
 dropwhile([{_, JobPid, _} = E|R], H, NotJobs) ->
     case lists:member(JobPid, NotJobs) of
         false -> {JobPid, lists:reverse(H) ++ R};
@@ -130,8 +140,8 @@ dropwhile([{_, JobPid, _} = E|R], H, NotJobs) ->
 % the job actually starts a new task (1 / NumCores increase in its share)
 % which might not be always true. Fairness fairy will eventually fix the
 % bias.
--spec bias_priority(job(), prioq(), gb_tree(), non_neg_integer())
-                   -> {gb_tree(), prioq()}.
+-spec bias_priority(job(), prioq(), job_map(), non_neg_integer())
+                   -> {job_map(), prioq()}.
 bias_priority(#job{name = N, pid = JobPid, bias = OldBias, prio = OldPrio} = Job,
               PrioQ, Jobs, NumCores) ->
     Bias = OldBias + 1 / NumCores,

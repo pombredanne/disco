@@ -16,21 +16,26 @@ op('POST', "/disco/job/" ++ _, Req) ->
     if BodySize > ?MAX_JOB_PACKET ->
             Req:respond({413, [], ["Job packet too large"]});
     true ->
-            Body = Req:recv_body(?MAX_JOB_PACKET),
-            Reply =
-                try
-                    {ok, JobName} = job_coordinator:new(Body),
-                    [<<"ok">>, list_to_binary(JobName)]
-                catch Err ->
-                        ErrorString = disco:format("Job failed to start: ~p", [Err]),
-                        lager:warning("Job failed to start:~p", [Err]),
-                        [<<"error">>, list_to_binary(ErrorString)];
-                      K:E ->
-                        ErrorString = disco:format("Job failed to start: ~p:~p", [K, E]),
-                        lager:warning("Job failed to start: ~p:~p", [K, E]),
-                        [<<"error">>, list_to_binary(ErrorString)]
-                end,
-            reply({ok, Reply}, Req)
+        case application:get_env(accept_new_jobs) of
+            {ok, 0} ->
+                Req:respond({403, [], ["No new jobs should be submitted to this cluster."]});
+            _ ->
+                Body = Req:recv_body(?MAX_JOB_PACKET),
+                Reply =
+                    try
+                        {ok, JobName} = job_coordinator:new(Body),
+                        [<<"ok">>, list_to_binary(JobName)]
+                    catch Err ->
+                            ErrorString = disco:format("Job failed to start: ~p", [Err]),
+                            lager:warning("Job failed to start:~p", [Err]),
+                            [<<"error">>, list_to_binary(ErrorString)];
+                          K:E ->
+                            ErrorString = disco:format("Job failed to start: ~p:~p", [K, E]),
+                            lager:warning("Job failed to start: ~p:~p", [K, E]),
+                            [<<"error">>, list_to_binary(ErrorString)]
+                    end,
+                reply({ok, Reply}, Req)
+        end
     end;
 
 op('POST', "/disco/ctrl/" ++ Op, Req) ->
@@ -98,7 +103,7 @@ getop("jobevents", {Query, Name}) ->
             false  -> "";
             {_, F} -> string:to_lower(F)
         end,
-    {ok, Ev} = event_server:get_job_msgs(Name, string:to_lower(Q), Num),
+    {ok, Ev} = event_server:get_job_msgs(Name, Q, Num),
     {raw, Ev};
 
 getop("nodeinfo", _Query) ->
@@ -141,7 +146,7 @@ getop("get_gc_blacklist", _Query) ->
     {ok, [list_to_binary(disco:host(N)) || N <- Nodes]};
 
 getop("get_settings", _Query) ->
-    L = [max_failure_rate],
+    L = [max_failure_rate, accept_new_jobs],
     {ok, {struct, lists:filter(fun(X) -> is_tuple(X) end,
                                lists:map(
                                  fun(S) ->
@@ -267,6 +272,10 @@ update_setting(<<"max_failure_rate">>, Val, App) ->
     ok = application:set_env(App, max_failure_rate,
                              list_to_integer(binary_to_list(Val)));
 
+update_setting(<<"accept_new_jobs">>, Val, App) ->
+    ok = application:set_env(App, accept_new_jobs,
+                             list_to_integer(binary_to_list(Val)));
+
 update_setting(Key, Val, _) ->
     lager:info("Unknown setting: ~p = ~p", [Key, Val]).
 
@@ -278,7 +287,7 @@ dfind(Key, Dict, Default) ->
 
 -spec render_jobinfo(event_server:job_eventinfo(), {[host()], [stage_name()]})
                     -> term().
-render_jobinfo({Start, Status0, JobInfo, Results, Count, Ready, Fail},
+render_jobinfo({Start, Status0, JobInfo, Results, Count, Pending, Ready, Fail},
                {Hosts, Stages}) ->
     Run = lists:foldl(fun(S, D) -> dict:update_counter(S, 1, D) end,
                       dict:new(),
@@ -296,9 +305,11 @@ render_jobinfo({Start, Status0, JobInfo, Results, Count, Ready, Fail},
                 Inputs = lists:flatten([pipeline_utils:input_urls(Input, split, {0, " "})
                                         || {_Id, Input} <- I]),
                 {list_to_binary(atom_to_list(Status0)),
-                 [[S, dfind(S, Count, 0) - (R + D), R, D, dfind(S, Fail, 0)]
-                  || {S, _} <- P,
-                     R <- [dfind(S, Run, 0)], D <- [dfind(S, Ready, 0)]],
+                 [[S, Pend, dfind(S, Count, 0) - (R + D), R, D, dfind(S, Fail, 0)]
+                  || {S, _, _} <- P,
+                      R <- [dfind(S, Run, 0)],
+                      Pend <- [dfind(S, Pending, 0)],
+                      D <- [dfind(S, Ready, 0)]],
                  lists:flatten([Urls || {_L, Urls} <- Inputs]),
                  W, O}
         end,

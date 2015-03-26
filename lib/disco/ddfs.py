@@ -30,7 +30,7 @@ def canonizetag(tag):
                 return canonizetag(tag)
         elif tag.startswith('tag://'):
             return tag
-        elif '://' not in tag and '/' not in tag:
+        elif '://' not in tag and '/' not in tag and tag != '-':
             return 'tag://{0}'.format(tag)
     raise InvalidTag("Invalid tag: {0}".format(tag))
 
@@ -132,7 +132,7 @@ class DDFS(object):
         Chunks the contents of `urls`,
         pushes the chunks to ddfs and tags them with `tag`.
         """
-        from disco.core import classic_iterator
+        from disco.core import result_iterator
 
         if 'reader' not in kwargs:
             kwargs['reader'] = None
@@ -140,7 +140,7 @@ class DDFS(object):
         def chunk_iter(replicas):
             chunker = Chunker(chunk_size=chunk_size,
                     max_record_size=max_record_size)
-            return chunker.chunks(classic_iterator([replicas], **kwargs))
+            return chunker.chunks(result_iterator([replicas], **kwargs))
 
         def chunk_name(replicas, n):
             url = listify(replicas)[0]
@@ -385,6 +385,10 @@ class DDFS(object):
                     for url in self._upload(urls, source, to_master=False, **kwargs)]
         except CommError as e:
             scheme, (host, port), path = urlsplit(e.url)
+            if hasattr(source, "seek"):
+                source.seek(0)  # source will be read again; seek to the beginning
+            else:
+                print("{0} is not seekable, retrying".format(source))
             return self._push((source, target),
                               replicas=replicas,
                               forceon=forceon,

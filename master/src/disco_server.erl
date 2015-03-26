@@ -4,7 +4,7 @@
 -export([start_link/0]).
 -export([update_config_table/3, get_active/1, get_nodeinfo/1, get_purged/1,
          new_job/3, kill_job/1, kill_job/2, purge_job/1, clean_job/1,
-         new_task/2, connection_status/2, manual_blacklist/2, gc_blacklist/1,
+         new_task/1, connection_status/2, manual_blacklist/2, gc_blacklist/1,
          get_worker_jobpack/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
@@ -29,9 +29,9 @@
                 stats_crashed :: non_neg_integer()}).
 -type dnode() :: #dnode{}.
 
--record(state, {workers = gb_trees:empty() :: gb_tree(), % pid()    -> {host(), task()}
-                nodes   = gb_trees:empty() :: gb_tree(), % host()   -> dnode()
-                purged  = gb_trees:empty() :: gb_tree(), % binary() -> timestamp()
+-record(state, {workers = gb_trees:empty() :: disco_gbtree(pid(), {host(), task()}),
+                nodes   = gb_trees:empty() :: disco_gbtree(host(), dnode()),
+                purged  = gb_trees:empty() :: disco_gbtree(binary(), erlang:timestamp()),
                 jobpack_queue :: pid(),
 
                 % The below are only used in cluster-in-a-box mode.
@@ -105,9 +105,9 @@ purge_job(JobName) ->
 clean_job(JobName) ->
     gen_server:call(?MODULE, {clean_job, JobName}).
 
--spec new_task(task(), non_neg_integer()) -> ok | failed.
-new_task(Task, Timeout) ->
-    gen_server:call(?MODULE, {new_task, Task}, Timeout).
+-spec new_task(task()) -> ok.
+new_task(Task) ->
+    gen_server:cast(?MODULE, {new_task, Task, self()}).
 
 -spec connection_status(host(), up | down) -> ok.
 connection_status(Node, Status) ->
@@ -149,19 +149,23 @@ init(_Args) ->
 -type update_config_msg() :: {update_config_table, [disco_config:host_info()],
                               [host()], [host()]}.
 -spec handle_cast(update_config_msg() | schedule_next | {purge_job, jobname()},
-                  state()) -> gs_noreply().
+                  state()) -> gs_noreply();
+                 ({new_task, task(), pid()}, state()) -> gs_noreply().
 handle_cast({update_config_table, Config, ManualBlacklist, GCBlacklist}, S) ->
     {noreply, do_update_config_table(Config, ManualBlacklist, GCBlacklist, S)};
 
 handle_cast(schedule_next, S) ->
     {noreply, do_schedule_next(S)};
 
+handle_cast({new_task, Task, JC}, S) ->
+    do_new_task(Task, JC, S),
+    {noreply, S};
+
 handle_cast({purge_job, JobName}, S) ->
     {noreply, do_purge_job(JobName, S)}.
 
 -spec handle_call(dbg_state_msg(), from(), state()) -> gs_reply(state());
                  ({new_job, jobname(), pid()}, from(), state()) -> gs_reply(ok);
-                 ({new_task, task()}, from(), state()) -> gs_reply(ok | failed);
                  ({get_active, jobname()}, from(), state()) ->
                          gs_reply({ok, active_tasks()});
                  ({get_nodeinfo, all}, from(), state()) ->
@@ -177,9 +181,6 @@ handle_call(dbg_get_state, _, S) ->
 
 handle_call({new_job, JobName, JobCoord}, _, S) ->
     {reply, do_new_job(JobName, JobCoord, S), S};
-
-handle_call({new_task, Task}, _, S) ->
-    {reply, do_new_task(Task, S), S};
 
 handle_call({get_active, JobName}, _From, S) ->
     {reply, do_get_active(JobName, S), S};
@@ -312,7 +313,7 @@ allow_read(#dnode{}) ->
 -spec allow_task(dnode()) -> boolean().
 allow_task(#dnode{} = N) -> allow_write(N).
 
--spec update_nodes(gb_tree()) -> ok.
+-spec update_nodes(disco_gbtree(host(), dnode())) -> ok.
 update_nodes(Nodes) ->
     WhiteNodes = [{H, S, R}
                   || #dnode{host = H, slots = S, num_running = R}
@@ -443,9 +444,9 @@ do_gc_blacklist(Hosts, S) ->
     S.
 
 -spec start_worker(host(), pid(), task()) -> pid().
-start_worker(H, NM, {#task_spec{jobname = J, stage = S, taskid = TI}, _} = T) ->
-    event_server:event(J, "~s:~B assigned to ~s", [S, TI, H], none),
-    spawn_link(fun() -> disco_worker:start_link_remote(H, NM, T) end).
+start_worker(H, NM, {#task_spec{jehandler = JEHandler, stage = S, taskid = TI}, _} = T) ->
+    job_event:event(JEHandler, "master", "~s:~B assigned to ~s", [S, TI, H], none),
+    spawn_link(disco_worker, start_link_remote, [H, NM, T]).
 
 -spec schedule_next() -> ok.
 schedule_next() ->
@@ -497,9 +498,9 @@ do_new_job(JobName, JobCoord, _S) ->
     catch K:V -> {error, {K, V}}
     end.
 
--spec do_new_task(task(), state()) -> ok | failed.
+-spec do_new_task(task(), pid(), state()) -> ok.
 do_new_task({#task_spec{jobname = Job, taskid = TaskId},
-             #task_run{input = Inputs}} = Task,
+             #task_run{input = Inputs}} = Task, JC,
             #state{nodes = Nodes}) ->
     Locations = [pipeline_utils:locations(D) || {_Id, D} <- Inputs],
     LoadStats = lists:foldl(
@@ -516,13 +517,12 @@ do_new_task({#task_spec{jobname = Job, taskid = TaskId},
                 schedule_next(),
                 ok;
             unknown_job ->
-                % most likely job was killed
-                failed
+                job_coordinator:kill_job("unknown job", JC)
         end
     catch K:V ->
             lager:warning("Call to schedule task ~p of job ~p failed: ~p:~p",
                           [TaskId, Job, K, V]),
-            failed
+            job_coordinator:kill_job("Scheduling Error", JC)
     end.
 
 -spec do_get_active(jobname() | all, state()) -> {ok, active_tasks()}.

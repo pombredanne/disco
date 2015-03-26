@@ -16,9 +16,9 @@ Some of the :program:`ddfs` utilities also work with data stored in Disco's temp
    The documentation assumes that the executable ``$DISCO_HOME/bin/ddfs`` is on your system path.
    If it is not on your path, you can add it::
 
-        ln -s $DISCO_HOME/bin/ddfs /usr/local/bin
+        ln -s $DISCO_HOME/bin/ddfs /usr/bin
 
-   If ``/usr/local/bin`` is not in your ``$PATH``, use an appropriate replacement.
+   If ``/usr/bin`` is not in your ``$PATH``, use an appropriate replacement.
    Doing so allows you to simply call :command:`ddfs`, instead of specifying the complete path.
 
 Run :command:`ddfs help` for information on using the command line utility.
@@ -82,7 +82,7 @@ def cat(program, *urls):
         for replica in replicas:
             try:
                 return download(proxy_url(urlresolve(replica, master=program.ddfs.master),
-                                          to_master=False))
+                                          to_master=False), sleep=9)
             except Exception as e:
                 sys.stderr.write("{0}\n".format(e))
         if not ignore_missing:
@@ -117,6 +117,16 @@ def chunk(program, tag, *urls):
     """Usage: tag [url ...]
 
     Chunks the contents of the urls, pushes the chunks to ddfs and tags them.
+    For chunking a file in the current directory, a './' must be prepended to the
+    file name.  Otherwise, ddfs chunk assumes it is a tag name.
+    The character '-' can be used to specify that input can be read from stdin
+    for example:
+        cat chekhov.txt | ddfs chunk chekhov -
+    is the same as:
+        ddfs chunk chekhov ./chekhov.txt
+
+    and both of them chunk the chekhov.txt file from the local directory into
+    ddfs.
     """
     from itertools import chain
     from disco.util import reify
@@ -292,16 +302,17 @@ def push(program, tag, *files):
     tarballs = program.options.tarballs
     forceon= [] if not program.options.forceon else [program.options.forceon]
 
-    blobs = [] if tarballs else [file for file in files
-                                 if os.path.isfile(file)]
-
+    blobs = []
     for file in files:
         if tarballs:
             for name, buf, size in program.ddfs.tarblobs(file,
+                                                         compress=program.options.compress,
                                                          include=program.options.include,
                                                          exclude=program.options.exclude):
                 print("extracted {0}".format(name))
                 blobs += [(buf, name)]
+        elif os.path.isfile(file):
+            blobs += [file]
         elif os.path.isdir(file):
             if program.options.recursive:
                 blobs += [os.path.join(path, blob)
@@ -309,6 +320,9 @@ def push(program, tag, *files):
                           for blob in blobs]
             else:
                 print("{0} is a directory (not pushing).".format(file))
+        else:
+            raise Exception("{0}: No such file or directory".format(file))
+
     print("pushing...")
     program.ddfs.push(tag, blobs, replicas=replicas, forceon=forceon)
 
@@ -411,14 +425,14 @@ def xcat(program, *urls):
     the blobs reachable from the tags will be printed after any non-tag url[s].
     """
     from itertools import chain
-    from disco.core import classic_iterator
+    from disco.core import result_iterator
     from disco.util import iterify, reify
 
     tags, urls = program.separate_tags(*program.input(*urls))
     stream = reify(program.options.stream)
     reader = program.options.reader
     reader = reify('disco.worker.task_io.chain_reader' if reader is None else reader)
-    for record in classic_iterator(chain(urls, program.blobs(*tags)),
+    for record in result_iterator(chain(urls, program.blobs(*tags)),
                                    input_stream=stream,
                                    reader=reader):
         print('\t'.join('{0}'.format(e) for e in iterify(record)).rstrip())

@@ -164,13 +164,20 @@ class Worker(worker.Worker):
         def get(key, default=None):
             return self.getitem(key, job, jobargs, default)
         stages, pipeline = set(), []
-        for g, s in get('pipeline', []):
+        for stage in get('pipeline', []):
+            if len(stage) == 2:
+                g, s = stage
+                concurrent = False
+            elif len(stage) == 3:
+                g, s, concurrent = stage
+            else:
+                raise DiscoError("Bad Stage {0}".format(stage))
             if g not in self.group_ops:
                 raise DiscoError("Unknown grouping {0}".format(g))
             if s.name in stages:
                 raise DiscoError("Repeated stage {0}".format(s.name))
             stages.add(s.name)
-            pipeline.append((s.name, g))
+            pipeline.append((s.name, g, concurrent))
 
         from disco.util import isiterable, inputlist
         job_input = get('input', [])
@@ -186,12 +193,6 @@ class Worker(worker.Worker):
                         'pipeline': pipeline,
                         'inputs' : pipe_input})
         return jobdict
-
-    def should_save_results(self, task, job, jobargs):
-        """
-        The outputs of the last stage are already saved.
-        """
-        return False
 
     def run(self, task, job, **jobargs):
         # Entry point into the executing pipeline worker task.  This
@@ -227,14 +228,14 @@ class Worker(worker.Worker):
 
     def make_interface(self, task, stage, params):
         def output_open(url):
-            return task_io.ClassicFile(url, stage.output_chain, params)
+            return task_io.StreamCombiner(url, stage.output_chain, params)
         def output(label):
             return self.output(task, label, open=output_open).file.fds[-1]
         return DiscoTask(output=output)
 
     def labelexpand(self, task, stage, input, params):
         def input_open(url):
-            return task_io.ClassicFile(url, stage.input_chain, params)
+            return task_io.StreamCombiner(url, stage.input_chain, params)
         def make_input(inp):
             return worker.Input(inp, task=task, open=input_open)
         if input.isindex:

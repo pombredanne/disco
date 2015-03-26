@@ -59,6 +59,10 @@ from disco.error import DataError
 from disco.fileutils import DiscoOutput, NonBlockingInput, Wait, AtomicFile
 from disco.comm import open_url
 
+
+# Maximum amount of time a task might take to finish.
+DISCO_WORKER_MAX_TIME = 24 * 60 * 60
+
 class MessageWriter(object):
     def __init__(self, worker):
         self.worker = worker
@@ -67,6 +71,9 @@ class MessageWriter(object):
         string = string.strip()
         if string:
             self.worker.send('MSG', force_utf8(string))
+
+    def isatty(self):
+        return False
 
     def flush(self):
         pass
@@ -188,6 +195,7 @@ class Worker(dict):
         return {'prefix': self.getitem('name', job, jobargs),
                 'save_results': self.getitem('save_results', job, jobargs, False),
                 'save_info': self.getitem('save_info', job, jobargs, "ddfs"),
+                'scheduler': self.getitem('scheduler', job, jobargs, {}),
                 'owner': self.getitem('owner', job, jobargs,
                                       job.settings['DISCO_JOB_OWNER'])}
 
@@ -305,12 +313,8 @@ class Worker(dict):
         self.getitem(task.stage, job, jobargs)(task, job, **jobargs)
 
     def end(self, task, job, **jobargs):
-        if self.should_save_results(task, job, jobargs):
-            self.save_outputs(task.jobname, master=task.master)
-            self.send('MSG', "Results saved to DDFS")
-        else:
-            self.send_outputs()
-            self.send('MSG', "Results sent to master")
+        self.send_outputs()
+        self.send('MSG', "Results sent to master")
 
     @classmethod
     def main(cls):
@@ -327,7 +331,8 @@ class Worker(dict):
                   as the worker module is also generally imported on the client side.
         """
         try:
-            sys.stdin = NonBlockingInput(sys.stdin, timeout=600)
+            sys.stdin = NonBlockingInput(sys.stdin,
+                                         timeout=3 * DISCO_WORKER_MAX_TIME)
             sys.stdout = sys.stderr = MessageWriter(cls)
             cls.send('WORKER', {'pid': os.getpid(), 'version': "1.1"})
             task = cls.get_task()
@@ -369,14 +374,14 @@ class Worker(dict):
         return [(id, str(url)) for id, url in replicas]
 
     @classmethod
-    def get_inputs(cls, done=False, exclude=()):
-        while not done:
-            done, inputs = cls.send('INPUT')
+    def get_inputs(cls, done=False, exclude=[]):
+        while done != "done":
+            done, inputs = cls.send('INPUT', ['exclude', exclude])
             for id, _status, label, _replicas in inputs:
                 if id not in exclude:
                     label = label if label == 'all' else int(label)
                     yield IDedInput((cls, id, label))
-                    exclude += (id, )
+                    exclude.append(id)
 
     @classmethod
     def labelled_input_map(cls, task, inputs):
@@ -416,14 +421,6 @@ class Worker(dict):
     def get_task(cls):
         from disco.task import Task
         return Task(**dict((str(k), v) for k, v in cls.send('TASK').items()))
-
-    def save_outputs(self, jobname, master=None):
-        from disco.ddfs import DDFS
-        def paths():
-            for output in self.outputs.values():
-                output.file.close()
-                yield output.path
-        self.send('OUTPUT', [0, "tag://" + DDFS(master).save(jobname, paths()), 0])
 
     def send_outputs(self):
         for output in self.outputs.values():

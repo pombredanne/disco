@@ -1,6 +1,7 @@
 """
-:mod:`disco.worker.task_io` --- I/O Utility functions for Disco tasks
+:mod:`disco.worker.task_io` -- I/O Utility functions for Disco tasks
 =====================================================================
+
 """
 
 from disco import util
@@ -335,17 +336,21 @@ default_stream = (task_input_stream, )
 gzip_stream = (task_input_stream, gzip_reader)
 gzip_line_stream = (task_input_stream, gzip_line_reader)
 
-class ClassicFile(object):
+class StreamCombiner(object):
     def __init__(self, url, streams, params, fd=None, size=None):
         self.fds = []
         for stream in streams:
             maybe_params = (params,) if util.argcount(stream) == 4 else ()
-            fd = stream(fd, size, url, *maybe_params)
-            if isinstance(fd, tuple):
-                if len(fd) == 3:
-                    fd, size, url = fd
-                else:
-                    fd, url = fd
+            if url == '-':
+                import sys
+                fd = sys.stdin
+            else:
+                fd = stream(fd, size, url, *maybe_params)
+                if isinstance(fd, tuple):
+                    if len(fd) == 3:
+                        fd, size, url = fd
+                    else:
+                        fd, url = fd
             self.fds.append(fd)
 
     def __iter__(self):

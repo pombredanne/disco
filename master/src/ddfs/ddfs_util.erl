@@ -1,6 +1,6 @@
 -module(ddfs_util).
 -export([concatenate/2, diskspace/1, ensure_dir/1, fold_files/3,
-         hashdir/5, hashdir/4, safe_rename/2]).
+        foreach_file/2, hashdir/5, hashdir/4, safe_rename/2]).
 -export([startswith/2, is_valid_name/1, make_valid_name/1,
          unpack_objname/1, pack_objname/2]).
 -export([cluster_url/2, parse_url/1, url_to_name/1]).
@@ -215,20 +215,47 @@ diskspace(Path) ->
         _ -> {error, invalid_output}
     end.
 
--spec fold_files(string(), fun((string(), string(), T) -> T), T) -> T.
+-spec foreach_file(string(), fun((string(), non_neg_integer(), string()) -> ok)) -> ok.
+foreach_file(Dir, Fun) ->
+    Base = Dir ++ "/",
+    case prim_file:list_dir(Dir) of
+        {ok, L} ->
+            lists:foreach(
+              fun(F) ->
+                      Path =  Base ++ F,
+                      case prim_file:read_file_info(Path) of
+                          {ok, #file_info{type = directory}} ->
+                              foreach_file(Path, Fun);
+                          {ok, #file_info{size = Size}} ->
+                              Fun(F, Size, Dir)
+                      end
+              end, L);
+        {error, Error} ->
+            error_logger:info_msg("Could not read Dir ~p (~p)" ++
+                                  " ignoring all contents", [Dir, Error]),
+            ok
+    end.
+
+-spec fold_files(string(), fun((string(), non_neg_integer(), string(), T) -> T), T) -> T.
 fold_files(Dir, Fun, Acc0) ->
     Base = Dir ++ "/",
-    {ok, L} = prim_file:list_dir(Dir),
-    lists:foldl(
-      fun(F, Acc) ->
-              Path =  Base ++ F,
-              case prim_file:read_file_info(Path) of
-                  {ok, #file_info{type = directory}} ->
-                      fold_files(Path, Fun, Acc);
-                  _ ->
-                      Fun(F, Dir, Acc)
-              end
-      end, Acc0, L).
+    case prim_file:list_dir(Dir) of
+        {ok, L} ->
+            lists:foldl(
+              fun(F, Acc) ->
+                      Path =  Base ++ F,
+                      case prim_file:read_file_info(Path) of
+                          {ok, #file_info{type = directory}} ->
+                              fold_files(Path, Fun, Acc);
+                          {ok, #file_info{size = Size}} ->
+                              Fun(F, Size, Dir, Acc)
+                      end
+              end, Acc0, L);
+        {error, Error} ->
+            error_logger:info_msg("Could not read Dir ~p (~p)" ++
+                                  " ignoring all contents", [Dir, Error]),
+            Acc0
+    end.
 
 -spec start_web(non_neg_integer(), fun() , term()) -> {ok, pid()} | {error, term()}.
 start_web(Port, Func, Name) ->
